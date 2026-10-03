@@ -91,31 +91,11 @@ Knitting writes the tables and figures to Resultados/.
 **Analyses performed outside R**
 Three steps were run outside this document. Their outputs are expected under Resultados/, and the parameters used are documented in the Materials and Methods section of the thesis:
 
-Tool
-Version
-Where it was run
-Input
-Output goes to
-Purpose
-QUAST
-5.3.0
-Galaxy (usegalaxy.org)
-Genome assemblies (Datos/genomas/FASTA/)
-Resultados/qc/quast/
-Assembly quality metrics
-CheckM2
-1.1.0
-Galaxy (usegalaxy.org)
-Genome assemblies (Datos/genomas/FASTA/)
-Resultados/qc/checkm2.tabular
-Completeness and contamination
-RGI / CARD
-6.0.5 / 4.0.1
-card.mcmaster.ca
-Resultados/proteinas_vecinas_CARD.fasta (written by the document itself)
-Resultados/Resultado_RGI/
-Resistance gene identification
-
+| Tool | Version | Where it was run | Input | Output goes to | Purpose |
+|---|---|---|---|---|---|
+| QUAST | 5.3.0 | Galaxy (usegalaxy.org) | Genome assemblies (`Datos/genomas/FASTA/`) | `Resultados/qc/quast/` | Assembly quality metrics |
+| CheckM2 | 1.1.0 | Galaxy (usegalaxy.org) | Genome assemblies (`Datos/genomas/FASTA/`) | `Resultados/qc/checkm2.tabular` | Completeness and contamination |
+| RGI / CARD | 6.0.5 / 4.0.1 | card.mcmaster.ca | `Resultados/proteinas_vecinas_CARD.fasta` (written by the document itself) | `Resultados/Resultado_RGI/` | Resistance gene identification |
 
 Methylation frequencies were estimated with the Tombo toolkit by the collaborating research team at Uppsala University and provided as wiggle files.
 
