@@ -1,5 +1,4 @@
-**Epigenetic characterisation of the genomic context of transposases in antibiotic-resistant Escherichia coli
-Code accompanying the Master's Thesis (Trabajo Fin de Máster) submitted for the Máster Universitario en Análisis de Datos Ómicos y Biología de Sistemas (Universidad de Sevilla / Universidad Internacional de Andalucía).**
+**Correlation between epigenetic marks and transposase-associated regions in antibiotic-resistant Escherichia coli**
 
 Author: Pablo Cano Jiménez
  Supervisors: Francine Amaral Piubeli, María Antonia Sánchez Romero
