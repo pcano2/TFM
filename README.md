@@ -54,7 +54,7 @@ Galaxy exports the QUAST and CheckM2 reports under long, auto-generated names (w
 
 Knitting writes the following to `Resultados/`:
 
-- `Figure2.jpg` to `Figure5.jpg` (Figure 1, the workflow diagram, was drawn separately)
+- `Figure2.jpg` to `Figure5.jpg` and `Supplementary_Figure_1.jpg` (`Figure 1`, the workflow diagram, was drawn separately)
 - `Table_1.csv` to `Table_3.csv`
 - `Supplementary_Table_S1.csv` and `Supplementary_Table_S2.csv`
 - Intermediate neighbour tables (`vecinos_*.tsv`, `vecindario_ampliado_completo.tsv`)
