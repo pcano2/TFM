@@ -1,0 +1,3161 @@
+---
+title: "Correlation between epigenetic marks and transposase-associated regions in antibiotic-resistant Escherichia coli"
+author: "Pablo Cano"
+output:
+  html_document:
+    toc: true
+  pdf_document:
+    toc: true
+---
+
+```{r packages and seed,  message=FALSE, warning=FALSE }
+# Load the necessary packages, set chunk defaults and a random seed
+library(Biostrings)
+library(readODS)
+library(patchwork)
+library(gggenes)
+library(janitor)
+library(tidyverse)
+
+knitr::opts_chunk$set(
+  dev       = "png",
+  dpi       = 300,
+  fig.align = "center",
+  out.width = "70%"
+)
+
+theme_set(theme_minimal(base_size = 10))
+set.seed(123)
+```
+
+```{r gbk to fasta}
+# Conversion from GenBank to nucleotide FASTA, as this is the input format required by QUAST, CheckM2 and mlplasmids. 
+
+
+carpetaGBK   <- "Datos/genomas/GENBANK"
+carpetaFASTA <- "Datos/genomas/FASTA"
+dir.create(carpetaFASTA, showWarnings = FALSE, recursive = TRUE)
+
+archivosGBK <- list.files(carpetaGBK, pattern = "\\.gbk$", full.names = TRUE)
+
+for (archivo in archivosGBK) {
+
+  lineas <- readLines(archivo, warn = FALSE)
+
+  ini_locus <- grep("^LOCUS",  lineas)
+  ini_seq   <- grep("^ORIGIN", lineas)
+  fin_seq   <- grep("^//",     lineas)
+
+  nombres <- sub("^LOCUS\\s+(\\S+).*", "\\1", lineas[ini_locus])
+
+  resultado <- character(2 * length(nombres))
+
+  for (i in seq_along(nombres)) {
+    bloque <- lineas[(ini_seq[i] + 1):(fin_seq[i] - 1)]
+#Numbers and spaces are removed, while retaining N and IUPAC ambiguity codes.
+
+    resultado[2 * i - 1] <- paste0(">", nombres[i])
+    resultado[2 * i]     <- paste(gsub("[^A-Za-z]", "", bloque), collapse = "")
+  }
+
+  writeLines(resultado, file.path(carpetaFASTA,
+                                  gsub("\\.gbk$", ".fasta", basename(archivo))))
+}
+
+cat("Generated FASTA files:", length(list.files(carpetaFASTA, pattern = "\\.fasta$")), "\n")
+```
+
+## 0. Quality control and other parameters
+Before starting the analysis, the quality of the 30 initial genomic assemblies was assessed. These corresponded to antibiotic-resistant E. coli strains isolated at Uppsala University Hospital (Sweden) between 2014 and 2015, received already assembled and annotated in GenBank format.
+
+Quality control was performed in Galaxy using two complementary tools: QUAST, which assesses assembly size and contiguity, and CheckM2, which estimates genome completeness and contamination based on single-copy marker genes.
+
+Based on these results, 2 of the 30 strains were excluded due to anomalous contamination and/or assembly fragmentation: DA63738 (6.53% contamination and atypical %GC) and DA64006 (highly fragmented assembly with 25 contigs). Thus, 28 strains were retained for the subsequent analyses.
+
+For the 28 retained strains, 4 samples showed discrepancies in the number of contigs reported by QUAST and CheckM2. This is expected because QUAST excludes contigs shorter than 500 bp, whereas CheckM2 does not apply this length filter. Therefore, the discrepancy does not indicate an error in either tool.
+
+```{r QC data, message=FALSE, warning=FALSE}
+carpeta_quast <- "Resultados/qc/quast"
+archivos_quast <- list.files(carpeta_quast, pattern = "\\.tabular$", full.names = TRUE)
+
+
+leer_quast <- function(f) {
+  read_tsv(f, col_names = c("metrica", "valor"), col_types = "cc") |>
+    pivot_wider(names_from = metrica, values_from = valor)
+}
+
+quast_raw <- map_dfr(archivos_quast, leer_quast) |>
+  clean_names()
+
+cat("Samples read from QUAST:", nrow(quast_raw), "\n")
+
+quast_final <- quast_raw |>
+  mutate(muestra = str_extract(assembly, "^[^_]+"), .before = 1) |>
+  select(muestra, number_contigs, total_length, largest_contig, gc_percent, n50, n90, l50, l90) |>
+  mutate(across(-muestra, as.numeric)) |>
+  rename_with(~ paste0(., "_quast"), -muestra)
+
+checkm2_final <- read_tsv("Resultados/qc/checkm2.tabular") |>
+  clean_names() |>
+  mutate(muestra = str_extract(name, "^[^_]+"), .before = 1) |>
+  select(muestra, completeness_general, contamination, genome_size, gc_content,
+         total_coding_sequences, total_contigs, max_contig_length, contig_n50) |>
+  rename_with(~ paste0(., "_checkm2"), -muestra)
+cat("Samples read from CheckM2:", nrow(checkm2_final), "\n")
+qc_completo <- quast_final |>
+  full_join(checkm2_final, by = "muestra")
+
+muestras_excluidas <- c("DA63738", "DA64006")
+
+qc_completo <- qc_completo |>
+  mutate(excluida = muestra %in% muestras_excluidas)
+
+qc_final_28 <- qc_completo |>
+  filter(!excluida)
+
+discrepancias_contigs <- qc_final_28 |>
+  filter(number_contigs_quast != total_contigs_checkm2) |>
+  select(muestra, number_contigs_quast, total_contigs_checkm2) |>
+  mutate(diferencia = total_contigs_checkm2 - number_contigs_quast)
+
+knitr::kable(
+  discrepancias_contigs,
+  caption = "Samples with discrepancies in the number of contigs between QUAST and CheckM2",
+  col.names = c(
+    "Sample",
+    "No. of contigs (QUAST)",
+    "No. of contigs (CheckM2)",
+    "Difference"
+  )
+)
+```
+
+```{r QC plot, message=FALSE, warning=FALSE}
+plot_qc <- qc_completo
+orden_muestras_qc <- plot_qc |> dplyr::arrange(desc(contamination_checkm2)) |> dplyr::pull(muestra)
+plot_qc <- plot_qc |>
+  mutate(muestra = factor(muestra, levels = orden_muestras_qc),
+         estado  = ifelse(excluida, "Excluded", "Included"))
+
+p_contam <- ggplot(plot_qc, aes(x = muestra, y = contamination_checkm2, fill = estado)) +
+  geom_col() +
+  scale_fill_manual(values = c("Included" = "#2E86AB", "Excluded" = "#E84855")) +
+  labs(title = "", x = NULL, y = "Contamination (%)") +
+  theme_minimal(base_size = 9) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), legend.position = "none")
+
+p_gc <- ggplot(plot_qc, aes(x = muestra, y = gc_percent_quast, fill = estado)) +
+  geom_col() +
+  coord_cartesian(ylim = c(45, 52)) +
+  scale_fill_manual(values = c("Included" = "#2E86AB", "Excluded" = "#E84855")) +
+  labs(title = "", x = NULL, y = "GC (%)") +
+  theme_minimal(base_size = 9) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), legend.position = "none")
+
+p_contigs <- ggplot(plot_qc, aes(x = muestra, y = total_contigs_checkm2, fill = estado)) +
+  geom_col() +
+  scale_fill_manual(values = c("Included" = "#2E86AB", "Excluded" = "#E84855")) +
+  labs(title = "", x = "Strain", y = "Number of contigs") +
+  theme_minimal(base_size = 9) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7), legend.position = "bottom") +
+  guides(fill = guide_legend(title = ""))
+
+p_contam / p_gc / p_contigs +
+  plot_annotation(
+    title    = "Strain exclusion based on quality control",
+    subtitle = "30 strains evaluated, 2 excluded"
+  )
+fig_s1 <- p_contam / p_gc / p_contigs +
+  plot_annotation(tag_levels = "A")
+
+fig_s1
+
+ggsave("Resultados/Supplementary_Figure_1.jpg", fig_s1,
+       width = 180, height = 150, units = "mm", dpi = 300)
+```
+
+To determine the replicon type (chromosome or plasmid) of each contig, mlplasmids was used, a machine-learning-based classifier specifically trained for different bacterial species, including *E. coli*. Based on sequence features of each contig, mlplasmids provides the probability of belonging to the chromosome (Prob_Chromosome) or plasmid (Prob_Plasmid), together with the resulting final prediction (Prediction). A total of 136 contigs were obtained, 84 of which were classified as plasmids and 52 as chromosomes.
+
+```{r mlplasmids, message=FALSE, warning=FALSE}
+
+library(mlplasmids, warn.conflicts = FALSE)
+
+carpetaFASTA  <- "Datos/genomas/FASTA"
+archivosFASTA <- list.files(carpetaFASTA, pattern = "\\.fasta$", full.names = TRUE)
+
+lista_resultados <- lapply(archivosFASTA, function(archivo) {
+  res <- plasmid_classification(
+    path_input_file = archivo,
+    species         = "Escherichia coli",
+    prob_threshold  = 0.5, 
+    min_length      = 500, 
+    full_output     = TRUE
+  )
+  res$sample_name <- basename(archivo)
+  res
+})
+
+tabla_plasmidos <- bind_rows(lista_resultados)
+dir.create("Resultados/replicon/mlplasmid", showWarnings = FALSE, recursive = TRUE)
+write.csv2(tabla_plasmidos, "Resultados/replicon/mlplasmid/resultados_replicon.csv",
+           row.names = FALSE)
+
+mlplasmids_final <- read_csv2("Resultados/replicon/mlplasmid/resultados_replicon.csv") |>
+  clean_names() |>
+  mutate(muestra = str_extract(sample_name, "^[^_]+"), .before = 1) |>
+  filter(!muestra %in% muestras_excluidas)
+
+knitr::kable(
+  tibble(
+    Type = c("Plasmids", "Chromosomes", "Total contigs"),
+    `Nº contigs` = c(
+      sum(mlplasmids_final$prediction == "Plasmid"),
+      sum(mlplasmids_final$prediction == "Chromosome"),
+      nrow(mlplasmids_final)
+    )
+  )
+)
+```
+
+## 1. Extraction of CDSs, transposases, and neighboring regions
+All transposases were extracted from the .GBK files. A gene was considered a transposase if its functional product annotation contained the word "transposase". We identified 2,461 transposase annotations, reduced to 2,342 after the frameshift correction described below.
+ 
+```{r Extraction of transposases , cache=TRUE, cache.lazy=FALSE}
+#We extracted all transposases.
+carpetaGENBANK <- "Datos/genomas/GENBANK"
+archivosGENBANK <- list.files(carpetaGENBANK, pattern = "\\.gbk$", full.names = TRUE)
+archivosGENBANK <- archivosGENBANK[!str_extract(basename(archivosGENBANK), "^[^_]+") %in% muestras_excluidas]
+
+transposasas_gbk <- lapply(archivosGENBANK, function(archivo) {
+  
+  lineas <- readLines(archivo)
+  muestra <- basename(archivo)
+  resultados <- list()
+  contig_actual <- NA
+  i <- 1
+  
+  while (i <= length(lineas)) {
+    
+    if (grepl("^LOCUS", lineas[i])) {
+      contig_actual <- gsub("^LOCUS\\s+(\\S+).*", "\\1", lineas[i])
+    }
+    
+    if (grepl("^     CDS ", lineas[i])) {
+      
+      coords <- gsub(".*CDS\\s+", "", lineas[i])
+      strand <- ifelse(grepl("complement", coords), "-", "+")
+      coords <- gsub("complement\\(|\\)|join\\(", "", coords)
+      coords <- trimws(coords)
+      start <- gsub("\\..*", "", coords)
+      end   <- gsub(".*\\.\\.", "", coords)
+      
+      locus_tag <- NA
+      product   <- NA
+      j <- i + 1
+      
+      while (j <= length(lineas) && grepl("^\\s{20}", lineas[j])) {
+        if (grepl("/locus_tag=", lineas[j]))
+          locus_tag <- gsub('.*locus_tag="([^"]+)".*', "\\1", lineas[j])
+        if (grepl("/product=", lineas[j]))
+          product <- gsub('.*product="([^"]+)".*', "\\1", lineas[j])
+        j <- j + 1
+      }
+      
+      if (!is.na(product) && grepl("transposase", product, ignore.case = TRUE)) {
+        resultados[[length(resultados) + 1]] <- data.frame(
+          Muestra = muestra, contig = contig_actual, locus_tag = locus_tag,
+          product = product, start = start, end = end, strand = strand
+        )
+      }
+      i <- j
+    } else {
+      i <- i + 1
+    }
+  }
+  
+  if (length(resultados) > 0) bind_rows(resultados) else NULL
+  
+}) |> bind_rows()
+
+cat("Total raw transposases:", nrow(transposasas_gbk), "\n")
+
+
+#Add length
+trans <- transposasas_gbk |>
+  mutate(
+    start    = as.integer(start),
+    end      = as.integer(end),
+    longitud = end - start + 1
+  )
+
+#FILTER: malformed product annotation (InsK)
+mal_formateados <- trans |> filter(grepl('/product=|^\\s{20}', product))
+cat("Malformed product annotation:", nrow(mal_formateados), "\n")
+
+trans <- trans |>
+  mutate(product = ifelse(
+    grepl('^\\s*/product=', product),
+    "Putative transposase InsK for insertion sequence",
+    product
+  ))
+
+cat("Malformed after cleaning:", sum(grepl('^\\s*/product=', trans$product)), "\n")
+
+#Family column
+trans <- trans |>
+  mutate(familia = case_when(
+    grepl("family", product, ignore.case = TRUE) ~ gsub("^(\\S+)\\s+family.*", "\\1", product),
+    TRUE ~ product
+  ))
+ 
+trans %>%
+  dplyr::slice_sample(n = 5) %>%
+  mutate(
+    Muestra = str_extract(Muestra, "^[^_]+"),
+    product = str_trunc(product, 40),
+    familia = str_trunc(familia, 30)
+  ) %>%
+  select(Muestra, contig, locus_tag, familia, product, start, end, strand, longitud) %>%
+  knitr::kable(
+  caption = "Example of identified transposases (random sample of 5)",
+  col.names = c("Strain", "Contig", "Locus tag", "Family", "Product", "Start", "End", "Strand", "Length")
+)
+```
+
+We processes all GenBank files to extract information from annotated CDSs, including their locus tag, product, genomic coordinates, contig, and strand. We extracted 135177 CDSs.
+
+```{r Extraction of CDSs, cache=TRUE, cache.lazy=FALSE}
+#Extraction of CDSs
+todos_cds <- lapply(archivosGENBANK, function(archivo) {
+  
+  lineas <- readLines(archivo)
+  muestra <- basename(archivo)
+  resultados <- list()
+  contig_actual <- NA
+  i <- 1
+  
+  while (i <= length(lineas)) {
+    
+    if (grepl("^LOCUS", lineas[i])) {
+      contig_actual <- gsub("^LOCUS\\s+(\\S+).*", "\\1", lineas[i])
+    }
+    
+    if (grepl("^     CDS ", lineas[i])) {
+      
+      coords <- gsub(".*CDS\\s+", "", lineas[i])
+      strand <- ifelse(grepl("complement", coords), "-", "+")
+      coords <- gsub("complement\\(|\\)|join\\(", "", coords)
+      coords <- trimws(coords)
+      start <- gsub("\\..*", "", coords)
+      end   <- gsub(".*\\.\\.", "", coords)
+      
+      locus_tag <- NA
+      product   <- NA
+      j <- i + 1
+      
+      while (j <= length(lineas) && grepl("^\\s{20}", lineas[j])) {
+        if (grepl("/locus_tag=", lineas[j]))
+          locus_tag <- gsub('.*locus_tag="([^"]+)".*', "\\1", lineas[j])
+        if (grepl("/product=", lineas[j]))
+          product <- gsub('.*product="([^"]+)".*', "\\1", lineas[j])
+        j <- j + 1
+      }
+      
+      if (!is.na(locus_tag)) {
+        resultados[[length(resultados) + 1]] <- data.frame(
+          Muestra   = muestra,
+          contig    = contig_actual,
+          locus_tag = locus_tag,
+          product   = product,
+          start     = as.integer(start),
+          end       = as.integer(end),
+          strand    = strand
+        )
+      }
+      i <- j
+    } else {
+      i <- i + 1
+    }
+  }
+  
+  if (length(resultados) > 0) bind_rows(resultados) else NULL
+  
+}) |> bind_rows()
+
+cat("Total CDSs extracted:", nrow(todos_cds), "\n")
+```
+
+ 
+```{r}
+# DETECTING TRANSPOSASES SPLIT BY A TRANSLATIONAL FRAMESHIFT
+
+# Some IS families (IS3, IS1) express their active transposase from two overlapping reading frames (orfA/orfB), fused by a translational frameshift: the ribosome skips one nucleotide and continues in the other frame. Prokka/Prodigal do not model this skip, causing two problems seen in our data:
+
+# CASE A - Transposase counted twice: both halves are named as a transposase and both end up in the table, so one real insertion is counted as two elements, each with half the true length.
+
+# CASE B - Phantom neighbour: only one half is named as a transposase; the other, matching no known domain, is left as "hypothetical protein". It isn't counted as a transposase, but it is still a row in `todos_cds`, so the nearest-neighbour search picks it up as a real neighbour when it's actually the rest of the same protein.
+
+
+# Families in which this mechanism is documented
+familias_riesgo <- c("IS3", "IS1")
+
+# Helper table: family of each locus_tag already classified as a transposase
+familia_por_locus <- trans %>% select(locus_tag, familia)
+
+# Detection: pairs of near-adjacent CDS (same contig/strain/strand, a gap of a few bp) where at least one of the two is already in trans
+
+posibles_pares <- todos_cds %>%
+  arrange(Muestra, contig, start) %>%
+  group_by(Muestra, contig) %>%
+  mutate(
+    start_sig   = lead(start),
+    end_sig     = lead(end),
+    strand_sig  = lead(strand),
+    locus_sig   = lead(locus_tag),
+    product_sig = lead(product),
+    gap         = start_sig - end
+  ) %>%
+  ungroup() %>%
+  filter(strand == strand_sig, gap >= -5, gap <= 5) %>%
+  filter(locus_tag %in% trans$locus_tag | locus_sig %in% trans$locus_tag)
+
+# Case A
+duplicados_transposasa <- posibles_pares %>%
+  filter(locus_tag %in% trans$locus_tag, locus_sig %in% trans$locus_tag) %>%
+  inner_join(familia_por_locus, by = "locus_tag") %>%
+  inner_join(familia_por_locus %>% rename(locus_sig = locus_tag, familia_sig = familia),
+             by = "locus_sig") %>%
+  filter(familia %in% familias_riesgo, familia_sig %in% familias_riesgo, familia == familia_sig)
+
+# Case B
+contaminacion_vecino <- posibles_pares %>%
+  filter(xor(locus_tag %in% trans$locus_tag, locus_sig %in% trans$locus_tag)) %>%
+  mutate(locus_transposasa = ifelse(locus_tag %in% trans$locus_tag, locus_tag, locus_sig)) %>%
+  inner_join(familia_por_locus, by = c("locus_transposasa" = "locus_tag")) %>%
+  filter(familia %in% familias_riesgo)
+
+cat("Case A - duplicated transposases:", nrow(duplicados_transposasa), "\n")
+dplyr::count(duplicados_transposasa, familia, sort = TRUE)
+
+cat("\nCase B - phantom neighbours:", nrow(contaminacion_vecino), "\n")
+dplyr::count(contaminacion_vecino, familia, sort = TRUE)
+
+# Case A correction: merge each pair into a single row with the full coordinates, and remove the leftover half
+fusiones <- duplicados_transposasa %>%
+  transmute(
+    Muestra, contig,
+    locus_tag_fusion    = locus_tag,
+    locus_tag_absorbido = locus_sig,
+    start_nuevo = pmin(start, start_sig),
+    end_nuevo   = pmax(end, end_sig)
+  )
+
+trans_original <- trans  
+
+trans <- trans %>%
+  filter(!locus_tag %in% fusiones$locus_tag_absorbido) %>%
+  left_join(fusiones %>% select(locus_tag_fusion, start_nuevo, end_nuevo),
+            by = c("locus_tag" = "locus_tag_fusion")) %>%
+  mutate(
+    start    = ifelse(!is.na(start_nuevo), start_nuevo, start),
+    end      = ifelse(!is.na(end_nuevo), end_nuevo, end),
+    longitud = end - start + 1
+  ) %>%
+  select(-start_nuevo, -end_nuevo)
+
+cat("\nTransposases in trans - before:", nrow(trans_original), "after:", nrow(trans), "\n")
+
+# Case B correction: remove the phantom fragment
+locus_fantasma <- contaminacion_vecino %>%
+  mutate(locus_fantasma = ifelse(locus_tag == locus_transposasa, locus_sig, locus_tag)) %>%
+  dplyr::pull(locus_fantasma) %>%
+  unique()
+
+todos_cds_original <- todos_cds  
+
+todos_cds <- todos_cds %>% filter(!locus_tag %in% locus_fantasma)
+
+cat("CDSs in todos_cds - before:", nrow(todos_cds_original), "after:", nrow(todos_cds), "\n")
+
+
+# Final check: abundance and median length of IS3/IS1 before and after the correction
+
+bind_rows(
+  trans_original %>% filter(familia %in% familias_riesgo) %>% mutate(estado = "antes"),
+  trans          %>% filter(familia %in% familias_riesgo) %>% mutate(estado = "despues")
+) %>%
+  group_by(estado, familia) %>%
+  summarise(n = n(), mediana_bp = median(longitud), .groups = "drop") %>%
+  arrange(familia, estado)
+```
+
+For each of the 2342 identified transposases, the closest neighboring gene on each side (upstream and downstream) was identified within a maximum distance of 500 bp and on the same contig. Each transposase was also assigned the replicon type (chromosome or plasmid) of the contig in which it was located, based on the classification obtained with mlplasmids (Section 0).
+ 
+ 
+```{r neighboring genes}
+# Identify neighboring genes
+distancia_max <- 500
+vecinos <- lapply(1:nrow(trans), function(i) {
+  
+  tp <- trans[i, ]
+  
+# CDSs from the same contig and sample, excluding the transposase itself.
+
+  cds_contig <- todos_cds |>
+    filter(Muestra == tp$Muestra,
+           contig  == tp$contig,
+           locus_tag != tp$locus_tag)
+  
+# Upstream gene: the gene that ends closest before the start of the transposase.
+  up <- cds_contig |>
+    filter(end <= tp$start,
+           (tp$start - end) <= distancia_max) |>
+    arrange(desc(end)) |>
+    slice(1)
+  
+# Downstream gene: the gene that starts closest after the end of the transposase.
+
+  down <- cds_contig |>
+    filter(start >= tp$end,
+           (start - tp$end) <= distancia_max) |>
+    arrange(start) |>
+    slice(1)
+  
+  tp$upstream_product  <- if (nrow(up) > 0) up$product else NA
+  tp$upstream_dist     <- if (nrow(up) > 0) tp$start - up$end else NA
+  tp$upstream_locus_tag <- if (nrow(up) > 0) up$locus_tag else NA
+  tp$downstream_product <- if (nrow(down) > 0) down$product else NA
+  tp$downstream_locus_tag <- if (nrow(down) > 0) down$locus_tag else NA
+  tp$downstream_dist    <- if (nrow(down) > 0) down$start - tp$end else NA
+  
+  tp
+  
+}) |> bind_rows()
+
+cat("Transposases with upstream genes:", sum(!is.na(vecinos$upstream_product)), "\n")
+cat("Transposases with downstream genes:", sum(!is.na(vecinos$downstream_product)), "\n")
+
+# Correctly formatted products among upstream and downstream genes
+
+vecinos <- vecinos |>
+  mutate(
+    upstream_product   = trimws(gsub('^\\s*/product="*', "", upstream_product)),
+    downstream_product = trimws(gsub('^\\s*/product="*', "", downstream_product))
+  )
+
+cat("Malformed upstream products:", 
+    sum(grepl('/product=', vecinos$upstream_product), na.rm = TRUE), "\n")
+cat("Malformed downstream products:", 
+    sum(grepl('/product=', vecinos$downstream_product), na.rm = TRUE), "\n")
+
+# Chromosome/plasmid location added for each transposase
+
+replicon_info <- mlplasmids_final |>
+  select(contig_name, contig_length, prediction) |>
+  rename(contig = contig_name,
+         longitud_contig = contig_length,
+         replicon = prediction)
+
+vecinos <- vecinos |>
+  left_join(replicon_info, by = "contig")
+
+#Verify
+cat("With assigned replicon:", sum(!is.na(vecinos$replicon)), "\n")
+cat("Without an assigned replicon:", sum(is.na(vecinos$replicon)), "\n")
+
+knitr::kable(
+  vecinos |> dplyr::count(replicon, sort = TRUE),
+  col.names = c("Replicon", "No. of transposases"),
+  caption = "Number of transposases by replicon"
+)
+
+vecinos <- vecinos |>
+  relocate(longitud_contig, replicon, .after = contig)
+
+write_tsv(vecinos, "Resultados/vecinos_raw.tsv")
+
+knitr::kable(
+  vecinos %>% dplyr::slice_sample(n = 5),
+  caption = "Random sample of 5 neighboring genes"
+)
+```
+
+Starting from the `vecinos_raw.tsv` table (wide format, with upstream and downstream neighbors in separate columns for each transposase), a long-format version was generated, where each row represents a single transposase–neighbor relationship, indicating whether the neighbor is upstream or downstream. This resulted in 4,684 transposase–neighbor relationships from the 2,342 identified transposases. A filter was then applied to exclude mobile elements and mobility-associated proteins, as well as hypothetical proteins without functional annotation. After filtering, 1,244 functional neighbor relationships were retained for subsequent analyses.
+
+```{r functional neighbors }
+translong <- vecinos
+
+# Keywords used to identify mobile elements and mobility-associated proteins (to be excluded)
+
+keywords_moviles <- c(
+  "transposase", "insertion sequence", "integrase",
+  "resolvase", "transposon", "rep-associated")
+
+es_movil <- function(x) {
+  str_detect(str_to_lower(x), paste(keywords_moviles, collapse = "|"))
+}
+
+# Conversion from wide to long format — each row represents a transposase–neighbor–sample relationship
+
+trans_long <- translong %>%
+  pivot_longer(
+    cols      = c(upstream_product, downstream_product),
+    names_to  = "posicion",
+    values_to = "gen_vecino"
+  ) %>%
+  mutate(
+    posicion     = if_else(posicion == "upstream_product", "upstream", "downstream"),
+    locus_vecino = if_else(posicion == "upstream", upstream_locus_tag, downstream_locus_tag),
+    distancia    = if_else(posicion == "upstream", upstream_dist, downstream_dist)
+  ) %>%
+  select(Muestra, contig, replicon, familia, locus_tag, start,
+         end, product, posicion, gen_vecino, locus_vecino, distancia)
+
+# Save unfiltered long-format data
+
+write_tsv(trans_long, "Resultados/vecinos_LONG_raw.tsv")
+
+# Filter: remove mobile elements, mobility-associated proteins and hypothetical proteins
+
+transfun_long <- trans_long %>%
+  filter(!es_movil(gen_vecino),
+         str_to_lower(gen_vecino) != "hypothetical protein")
+
+cat("Total transposase–neighbor relationships (long format):", nrow(trans_long), "\n")
+cat("Total functional neighbor relationships after filtering:", nrow(transfun_long), "\n")
+
+# Data are in long format, with up to two rows per transposase (upstream/downstream). Save filtered long-format data
+
+write_tsv(transfun_long, "Resultados/vecinosfun_long.tsv")
+
+transfun_long %>%
+  dplyr::slice_sample(n = 5) %>%
+  mutate(
+    Muestra    = str_extract(Muestra, "^[^_]+"),
+    familia    = str_trunc(familia, 20),
+    product    = str_trunc(product, 25),
+    gen_vecino = str_trunc(gen_vecino, 25)
+  ) %>%
+ knitr::kable(
+  caption = "Example of transposase–functional neighbor relationships (random sample of 5)",
+  col.names = c("Strain", "Contig", "Replicon", "Family", "Locus tag", "Start", "End",
+                "Product", "Position", "Neighboring gene", "Neighbor locus tag", "Distance")
+)
+```
+ 
+## 2. Genomic composition of the strains
+The 28 *E. coli* strains analyzed show variable total genome sizes, with substantial differences in the number and size of plasmids. The top panel shows the total genome size for each strain (chromosome + plasmids), ordered from largest to smallest. The bottom panel zooms in on the plasmids to facilitate comparison of their sizes. Labels indicate the number of plasmid-derived contigs per strain (p).
+
+```{r genomic composition, message=FALSE, warning=FALSE}
+contigs <- mlplasmids_final %>%
+  transmute(
+    Prediction    = prediction,
+    Contig_name   = contig_name,
+    Contig_length = contig_length,
+    cepa          = muestra
+  )
+
+contigs_clean <- contigs %>% filter(!is.na(Contig_length), Contig_length > 0)
+
+n_plasmidos <- contigs_clean %>%
+  filter(Prediction == "Plasmid") %>%
+  group_by(cepa) %>%
+  summarise(n_plasmidos = n_distinct(Contig_name), .groups = "drop")
+
+orden_cepas <- contigs_clean %>%
+  group_by(cepa) %>%
+  summarise(total = sum(Contig_length), .groups = "drop") %>%
+  arrange(desc(total)) %>%
+  dplyr::pull(cepa)
+
+total_por_cepa <- contigs_clean %>%
+  group_by(cepa) %>%
+  summarise(total = sum(Contig_length), .groups = "drop") %>%
+  left_join(n_plasmidos, by = "cepa") %>%
+  mutate(n_plas = replace_na(n_plasmidos, 0),
+         cepa = factor(cepa, levels = orden_cepas))
+
+contigs_indiv <- contigs_clean %>%
+  mutate(cepa = factor(cepa, levels = orden_cepas)) %>%
+  arrange(cepa, Prediction, desc(Contig_length)) %>%
+  group_by(cepa) %>%
+  mutate(plasmid_rank = ifelse(Prediction == "Plasmid",
+                               cumsum(Prediction == "Plasmid"), NA_integer_)) %>%
+  ungroup() %>%
+  mutate(segmento = case_when(
+    Prediction == "Chromosome" ~ "Chromosome contig",
+    TRUE ~ paste0("Plasmid contig ", plasmid_rank)
+  )) %>%
+  mutate(segmento = factor(segmento,
+                           levels = c("Chromosome contig", paste0("Plasmid contig ", 1:max(plasmid_rank, na.rm = TRUE)))))
+
+colores_plas <- c(
+  "Chromosome contig" = "#2E86AB",
+  "Plasmid contig 1"  = "#E84855",
+  "Plasmid contig 2"  = "#F4A261",
+  "Plasmid contig 3"  = "#2A9D8F",
+  "Plasmid contig 4"  = "#8338EC",
+  "Plasmid contig 5"  = "#FB5607",
+  "Plasmid contig 6"  = "#FFBE0B",
+  "Plasmid contig 7"  = "#3A86FF"
+)
+
+ymax <- max(total_por_cepa$total) / 1e6
+
+# Top panel: complete genome
+p_top <- ggplot(contigs_indiv, aes(x = cepa, y = Contig_length / 1e6, fill = segmento)) +
+  geom_col() +
+  geom_text(data = total_por_cepa,
+            aes(x = cepa, y = total / 1e6 + 0.05,
+                label = ifelse(n_plas > 0, paste0(n_plas, "p"), "")),
+            inherit.aes = FALSE, size = 2.5, angle = 90, hjust = 0, color = "grey30") +
+  scale_fill_manual(values = colores_plas) +
+  scale_y_continuous(breaks = seq(0, ceiling(ymax) + 0.5, by = 0.5),
+                     expand = expansion(mult = c(0, 0.12)),
+                     limits = c(0, NA)) +
+  labs(x = NULL, y = "Genome size (Mb)", fill = "Replicon") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        legend.position = "none")
+
+# Bottom panel: plasmid zoom
+p_bot <- ggplot(contigs_indiv %>% filter(Prediction == "Plasmid"),
+                aes(x = cepa, y = Contig_length / 1e6, fill = segmento)) +
+  geom_col() +
+  scale_fill_manual(values = colores_plas) +
+  scale_x_discrete(drop = FALSE) +
+  scale_y_continuous(breaks = seq(0, 0.5, by = 0.1),
+                     expand = expansion(mult = c(0, 0.05)),
+                     limits = c(0, 0.65)) +
+  labs(x = "Strain", y = "Plasmid size (Mb)", fill = "Replicon") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        legend.position = "right",
+        legend.key.size = unit(0.4, "cm"))
+
+# Combine with patchwork
+p_top / p_bot +
+  plot_annotation(
+    title    = "Genome size by strain",
+    subtitle = "Top: complete genome | Bottom: plasmid zoom",
+    caption  = "Numbering reflects rank by size and does not indicate homology or correspondence between plasmid contigs.",
+    theme    = theme(plot.caption = element_text(hjust = 0.5))
+  )
+```
+
+## 3. General characterization of transposases
+We identified 23 transposase families across the 28 strains. The most abundant families in terms of element count are IS3 (710 elements), IS1 (439 elements), IS66 (178 elements), ISNCY (146 elements), and IS21 (136 elements). On the other hand, the families with the widest strain distribution are IS200/IS605, IS3, ISKra4, and ISNCY, which show up in all 28 strains. IS1 is found in 26 out of the 28 strains, while IS66 and IS21 appear in 25. Some families, like IS1380 and IS1595, are only present in a single strain, which suggests they might have been acquired recently or are specific to a particular lineage.
+
+For this characterization, we used the unfiltered version of the transposase-neighbor dataset (vecinos_LONG_raw.tsv), not the filtered one. That's because the functional neighbor filter is applied to the neighboring gene, not to the transposase itself, if we used the filtered version, we'd risk losing transposases whose both upstream and downstream neighbors got filtered out because they're either mobile elements or hypothetical proteins. That would end up underestimating the actual number of families and elements we identified.
+
+```{r caracterizacion-transposasas}
+df <- read_tsv("Resultados/vecinos_LONG_raw.tsv", show_col_types = FALSE)
+
+# One row per transposase: the long format repeats each element once per neighbour
+is_unicas <- df |>
+  distinct(Muestra, locus_tag, .keep_all = TRUE) |>
+  mutate(cepa = str_extract(Muestra, "^[^_]+"))
+
+# Shorter labels for the two annotations not resolved to a formal family
+abbreviate_labels <- function(x) {
+  x |>
+    str_replace("Putative transposase InsK for insertion sequence", "InsK (putative)") |>
+    str_replace("REP-associated tyrosine transposase", "REP-tyrosine")
+}
+
+cat("Transposases:", nrow(is_unicas), "\n")
+cat("Family groups:", n_distinct(is_unicas$familia), "\n\n")
+
+# Per strain: element count, repertoire richness and density 
+por_cepa <- is_unicas |>
+  group_by(cepa) |>
+  summarise(n_transposasas = n(),
+            n_familias     = n_distinct(familia), .groups = "drop") |>
+  left_join(qc_final_28 |> select(cepa = muestra, total_length_quast), by = "cepa") |>
+  mutate(densidad_mb = n_transposasas / (total_length_quast / 1e6))
+
+cat("Transposases per strain:\n")
+print(summary(por_cepa$n_transposasas))
+
+cat("\nFamily groups per strain:\n")
+print(summary(por_cepa$n_familias))
+
+cat("\nSpearman correlation, transposase count vs genome size:",
+    round(cor(por_cepa$n_transposasas, por_cepa$total_length_quast,
+              method = "spearman"), 3), "\n\n")
+
+
+por_cepa |> arrange(n_transposasas) |> slice(1, n()) |> print()
+
+# Per family: abundance and prevalence 
+por_familia <- is_unicas |>
+  group_by(familia) |>
+  summarise(n_elementos = n(), n_muestras = n_distinct(Muestra), .groups = "drop") |>
+  arrange(desc(n_elementos))
+
+cat("\nThe five most abundant groups account for",
+    round(100 * sum(head(por_familia$n_elementos, 5)) / nrow(is_unicas), 1), "% of all elements\n")
+
+knitr::kable(por_familia |> mutate(familia = abbreviate_labels(familia)),
+             caption = "Abundance and prevalence of each transposase family",
+             col.names = c("Family", "Elements", "Strains (n = 28)"))
+
+# IS5 concentrated in two strains
+is_unicas |>
+  dplyr::filter(familia == "IS5") |>
+  dplyr::count(cepa, sort = TRUE) |>
+  knitr::kable(caption = "IS5 elements per strain",
+               col.names = c("Strain", "Elements"))
+
+```
+
+```{r heatmap-recuentos, fig.height=7, fig.width=9}
+conteos <- is_unicas |>
+  dplyr::count(cepa, familia) |>
+  tidyr::complete(cepa, familia, fill = list(n = 0))
+
+mat_n <- conteos |>
+  tidyr::pivot_wider(names_from = familia, values_from = n, values_fill = 0) |>
+  tibble::column_to_rownames("cepa") |>
+  as.matrix()
+
+orden_cepas_n    <- rownames(mat_n)[hclust(dist(log1p(mat_n)))$order]
+orden_familias_n <- colnames(mat_n)[hclust(dist(t(log1p(mat_n))))$order]
+
+conteos |>
+  dplyr::mutate(cepa    = factor(cepa,    levels = orden_cepas_n),
+                familia = factor(familia, levels = orden_familias_n)) |>
+  ggplot(aes(x = cepa, y = familia, fill = n)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  scale_fill_viridis_c(trans = "log1p", breaks = c(0, 1, 5, 20, 60),
+                       name = "Elements") +
+  scale_y_discrete(labels = abbreviate_labels) +
+  labs(x = "Strain", y = "IS family") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        panel.grid  = element_blank())
+```
+
+```{r figuras familias, fig.height=8, fig.width=7}
+ggplot(por_familia, aes(x = reorder(familia, n_elementos), y = n_elementos)) +
+  geom_col(fill = "#21908C") +
+  geom_text(aes(label = n_elementos), hjust = -0.2, size = 3) +
+  coord_flip() +
+  scale_x_discrete(labels = abbreviate_labels) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(x = "IS family", y = "Number of elements")
+
+ggplot(por_familia, aes(x = reorder(familia, n_muestras), y = n_muestras)) +
+  geom_col(fill = "#21908C") +
+  geom_text(aes(label = paste0(n_muestras, "/28")), hjust = -0.15, size = 3) +
+  coord_flip() +
+  scale_x_discrete(labels = abbreviate_labels) +
+  scale_y_continuous(limits = c(0, 32)) +
+  labs(x = "IS family", y = "Number of strains (n = 28)")
+```
+
+```{r transposase plot}
+is_unicas <- is_unicas %>%
+  mutate(cepa = str_extract(Muestra, "^[^_]+"))
+
+datos_B <- is_unicas %>%
+  group_by(cepa, familia) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(cepa = factor(cepa, levels = orden_cepas_n))
+
+n_familias <- n_distinct(datos_B$familia)
+paleta_pastel <- colorRampPalette(c(
+  "#AED6F1", "#A9DFBF", "#F9E79F", "#F5CBA7", "#D2B4DE",
+  "#A3E4D7", "#FAD7A0", "#ABEBC6", "#85C1E9", "#F1948A",
+  "#82E0AA", "#F8C471", "#BB8FCE", "#76D7C4", "#F0B27A",
+  "#7FB3D3", "#73C6B6", "#F7DC6F", "#C39BD3", "#7DCEA0"
+))(n_familias)
+names(paleta_pastel) <- sort(unique(datos_B$familia))
+
+ggplot(datos_B, aes(x = cepa, y = n, fill = familia)) +
+  geom_col() +
+  scale_fill_manual(values = paleta_pastel,
+                    labels = function(x) str_replace(x,
+                      "Putative transposase InsK for insertion sequence", "InsK (putative)") %>%
+                      str_replace("REP-associated tyrosine transposase", "REP-tyrosine")) +
+  labs(x = "Strain", y = "Number of transposases", fill = "Family") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x  = element_text(angle = 45, hjust = 1, size = 7.5, vjust = 1),
+        plot.margin  = margin(t = 5, r = 5, b = 20, l = 5),
+        legend.position   = "right",
+        legend.key.size   = unit(0.35, "cm"),
+        legend.text       = element_text(size = 7.5),
+        legend.box.margin = margin(l = 5))
+```
+
+## 4. Transposase distribution by replicon
+Each transposase inherits the replicon of the contig it lies in, as assigned by mlplasmids. Absolute counts are not informative on their own, since the chromosome is much larger and is therefore expected to accumulate more elements. The analysis is based instead on density — transposases per megabase of replicon — computed as one value per strain and replicon, which is also the unit required by the pseudoreplication control described in the Methods.
+
+Because both measurements come from the same strain, the comparison is paired: a Wilcoxon signed-rank test with the matched-pairs rank-biserial correlation as effect size.
+
+Finally, the analysis asks whether replicon preference depends on the family. For each family with at least 20 elements, the proportion of its copies located on plasmids is compared with the overall proportion in the dataset, shown as a reference line.
+ 
+Note that mlplasmids classifies individual contigs, so "plasmid" here refers to plasmid-predicted contigs rather than to complete plasmids.
+
+```{r reparto-replicon}
+# mlplasmids classifies contigs, not complete replicons: "Plasmid" here means plasmid-predicted contigs.
+total_replicon <- is_unicas |>
+  dplyr::mutate(tipo = ifelse(stringr::str_detect(replicon,
+                              stringr::regex("plasmid", ignore_case = TRUE)),
+                              "Plasmid", "Chromosome")) |>
+  dplyr::count(tipo, name = "n") |>
+  dplyr::mutate(pct = round(100 * n / sum(n), 1))
+
+knitr::kable(total_replicon,
+             caption = "Transposases by contig replicon type",
+             col.names = c("Replicon type", "Transposases", "%"))
+```
+
+```{r densidad-replicon}
+# Total length of chromosomal and plasmid-predicted contigs in each strain
+longitudes <- mlplasmids_final |>
+  dplyr::mutate(tipo = ifelse(stringr::str_detect(prediction,
+                              stringr::regex("plasmid", ignore_case = TRUE)),
+                              "Plasmid", "Chromosome")) |>
+  dplyr::group_by(muestra, tipo) |>
+  dplyr::summarise(mb = sum(contig_length) / 1e6, .groups = "drop")
+
+# Transposases per strain and replicon type
+conteo_rep <- is_unicas |>
+  dplyr::mutate(tipo = ifelse(stringr::str_detect(replicon,
+                              stringr::regex("plasmid", ignore_case = TRUE)),
+                              "Plasmid", "Chromosome")) |>
+  dplyr::count(cepa, tipo, name = "n")
+
+# Density: one value per strain and replicon type
+densidad <- longitudes |>
+  dplyr::rename(cepa = muestra) |>
+  dplyr::left_join(conteo_rep, by = c("cepa", "tipo")) |>
+  dplyr::mutate(n = tidyr::replace_na(n, 0),
+                densidad = n / mb)
+
+densidad |>
+  dplyr::group_by(tipo) |>
+  dplyr::summarise(strains = dplyr::n(),
+                   median  = round(median(densidad), 1),
+                   min     = round(min(densidad), 1),
+                   max     = round(max(densidad), 1)) |>
+  knitr::kable(caption = "Transposase density per replicon type (elements per Mb of chromosomal or plasmid-predicted contigs)",
+               col.names = c("Replicon type", "Strains", "Median", "Min", "Max"))
+```
+
+```{r test-densidad-replicon}
+comp <- densidad |>
+  tidyr::pivot_wider(id_cols = cepa, names_from = tipo, values_from = densidad) |>
+  tidyr::drop_na()
+
+cat("Strains with contigs of both replicon types:", nrow(comp), "\n")
+cat("Strains where plasmid-contig density exceeds chromosomal density:",
+    sum(comp$Plasmid > comp$Chromosome), "\n\n")
+
+w <- wilcox.test(comp$Plasmid, comp$Chromosome, paired = TRUE)
+print(w)
+
+# Matched-pairs rank-biserial correlation as effect size
+d <- comp$Plasmid - comp$Chromosome
+r_rb_rep <- sum(sign(d) * rank(abs(d))) / sum(rank(abs(d)))
+cat("\nMatched-pairs rank-biserial correlation:", round(r_rb_rep, 3), "\n")
+```
+
+```{r figura densidad replicon, fig.height=5, fig.width=4}
+densidad |>
+  ggplot(aes(x = tipo, y = densidad)) +
+  geom_line(aes(group = cepa), colour = "grey70", linewidth = 0.4) +
+  geom_point(aes(colour = tipo), size = 2.2) +
+  scale_y_log10() +
+  scale_colour_viridis_d(begin = 0.2, end = 0.75, guide = "none") +
+  labs(x = NULL, y = "Transposases per Mb of contig")
+```
+
+```{r enriquecimiento familia replicon, fig.height=5, fig.width=6}
+# Overall proportion of elements on plasmid-predicted contigs, used as reference
+prop_global <- mean(stringr::str_detect(is_unicas$replicon,
+                    stringr::regex("plasmid", ignore_case = TRUE)))
+
+enriquecimiento <- is_unicas |>
+  dplyr::mutate(tipo = ifelse(stringr::str_detect(replicon,
+                              stringr::regex("plasmid", ignore_case = TRUE)),
+                              "Plasmid", "Chromosome")) |>
+  dplyr::count(familia, tipo) |>
+  tidyr::pivot_wider(names_from = tipo, values_from = n, values_fill = 0) |>
+  dplyr::mutate(total = Chromosome + Plasmid,
+                prop_plasmid = Plasmid / total) |>
+  dplyr::filter(total >= 20) |>
+  dplyr::arrange(dplyr::desc(prop_plasmid))
+
+knitr::kable(enriquecimiento |>
+               dplyr::mutate(familia = abbreviate_labels(familia),
+                             prop_plasmid = round(100 * prop_plasmid, 1)),
+             caption = "Proportion of elements located on plasmid-predicted contigs, by family (families with at least 20 elements)",
+             col.names = c("Family", "Chromosome", "Plasmid", "Total", "% on plasmid contigs"))
+
+ggplot(enriquecimiento, aes(x = reorder(familia, prop_plasmid), y = prop_plasmid)) +
+  geom_col(fill = "#21908C") +
+  geom_hline(yintercept = prop_global, linetype = "dashed", colour = "grey40") +
+  coord_flip() +
+  scale_x_discrete(labels = abbreviate_labels) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "IS family", y = "Proportion of elements on plasmid-predicted contigs")
+```
+
+```{r}
+# Element-level breakdown of the plasmid-enriched families
+is_unicas |>
+  dplyr::filter(familia %in% c("IS6", "IS91", "Tn3")) |>
+  dplyr::count(familia, product, sort = TRUE) |>
+  knitr::kable(caption = "Annotated elements within the plasmid-enriched families",
+               col.names = c("Family", "Annotation", "Elements"))
+
+cat("Strains with no plasmid-predicted contig:",
+    paste(setdiff(unique(is_unicas$cepa), comp$cepa), collapse = ", "), "\n\n")
+
+excepcion <- comp |> dplyr::filter(Chromosome >= Plasmid)
+if (nrow(excepcion) == 0) {
+  cat("Plasmid-contig density exceeded chromosomal density in all", nrow(comp), "strains\n\n")
+} else {
+  cat("Strains where chromosomal density is not exceeded:",
+      paste(excepcion$cepa, collapse = ", "),
+      "— chromosome", round(excepcion$Chromosome, 1),
+      "vs plasmid", round(excepcion$Plasmid, 1), "per Mb\n\n")
+}
+
+contigs_plas <- mlplasmids_final |>
+  dplyr::filter(prediction == "Plasmid") |>
+  dplyr::count(muestra)
+
+cat("Plasmid-predicted contigs per strain: min", min(contigs_plas$n),
+    "| median", median(contigs_plas$n),
+    "| max", max(contigs_plas$n), "\n")
+```
+
+## 5. Transposase element length
+Element length is taken as the length of the coding sequence annotated as a transposase, computed as end − start + 1. It therefore reflects the annotated gene rather than the complete insertion sequence, an important distinction for families whose elements encode more than one open reading frame.
+
+Lengths are first compared between families, and then between replicon types. As in the previous section, the replicon comparison is aggregated to one median value per strain and replicon before testing, and the test is paired because both values come from the same strain.
+
+Because plasmids and chromosomes differ in family composition, any overall length difference between replicon types could be a compositional artefact. Length is therefore also examined within each of the most abundant families separately, to distinguish a genuine replicon effect from a difference in which families are present.
+
+```{r tam replicon}
+size_IS <- df |>
+  dplyr::mutate(cepa = stringr::str_extract(Muestra, "^[^_]+"),
+                type = ifelse(stringr::str_detect(replicon,
+                              stringr::regex("plasmid", ignore_case = TRUE)),
+                              "Plasmid", "Chromosome"),
+                size_pb = end - start + 1) |>
+  dplyr::distinct(cepa, locus_tag, type, size_pb)
+
+size_IS |>
+  dplyr::group_by(type) |>
+  dplyr::summarise(n = dplyr::n(),
+                   mean   = round(mean(size_pb), 1),
+                   median = round(median(size_pb), 1),
+                   sd     = round(sd(size_pb), 1), .groups = "drop") |>
+  knitr::kable(caption = "Transposase size (bp) by replicon type — element level",
+               col.names = c("Replicon type", "Elements", "Mean", "Median", "SD"))
+
+# Aggregation per strain to avoid pseudoreplication 
+size_by_strain <- size_IS |>
+  dplyr::group_by(cepa, type) |>
+  dplyr::summarise(median_size = median(size_pb), n_IS = dplyr::n(), .groups = "drop")
+
+size_by_strain |>
+  dplyr::group_by(type) |>
+  dplyr::summarise(n_strains = dplyr::n(),
+                   mean   = round(mean(median_size), 1),
+                   median = round(median(median_size), 1), .groups = "drop") |>
+  knitr::kable(caption = "Per-strain median transposase size (bp) by replicon type",
+               col.names = c("Replicon type", "Strains", "Mean", "Median"))
+
+# Normality of the aggregated values
+shapiro_size <- size_by_strain |>
+  dplyr::group_by(type) |>
+  dplyr::summarise(W       = shapiro.test(median_size)$statistic,
+                   p_value = shapiro.test(median_size)$p.value,
+                   normal  = ifelse(shapiro.test(median_size)$p.value >= 0.05, "Yes", "No"),
+                   .groups = "drop")
+
+shapiro_size |>
+  dplyr::mutate(p_value = format(p_value, scientific = TRUE, digits = 3)) |>
+  knitr::kable(caption = "Shapiro-Wilk test: normality of per-strain median size by replicon type")
+
+# Paired comparison: both values come from the same strain 
+comp_size <- size_by_strain |>
+  tidyr::pivot_wider(id_cols = cepa, names_from = type, values_from = median_size) |>
+  tidyr::drop_na()
+
+wsize <- wilcox.test(comp_size$Plasmid, comp_size$Chromosome, paired = TRUE)
+print(wsize)
+
+d_size <- comp_size$Plasmid - comp_size$Chromosome
+r_rb_size <- sum(sign(d_size) * rank(abs(d_size))) / sum(rank(abs(d_size)))
+
+cat("\nStrains compared:", nrow(comp_size), "\n")
+cat("Strains where plasmid elements are larger:", sum(d_size > 0), "\n")
+cat("Matched-pairs rank-biserial correlation:", round(r_rb_size, 3), "\n")
+```
+
+```{r figura tam replicon}
+ggplot(size_IS, aes(x = type, y = size_pb, fill = type)) +
+  geom_violin(alpha = 0.7, trim = FALSE, colour = "grey40") +
+  geom_boxplot(width = 0.14, fill = "white", outlier.shape = NA, colour = "grey25") +
+  scale_fill_viridis_d(begin = 0.1, end = 0.7, guide = "none") +
+  scale_x_discrete(labels = c("Chromosomal contigs", "Plasmid contigs")) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = NULL, y = "Element length (bp)")
+```
+
+```{r figura tamano familia,  warning=FALSE}
+tam_IS_familias <- is_unicas |>
+  dplyr::mutate(tamano = end - start + 1,
+                tipo = ifelse(stringr::str_detect(replicon,
+                              stringr::regex("plasmid", ignore_case = TRUE)),
+                              "Plasmid contigs", "Chromosomal contigs"))
+
+tam_IS_familias |>
+  dplyr::group_by(familia) |>
+  dplyr::filter(dplyr::n() >= 5) |>
+  dplyr::ungroup() |>
+  ggplot(aes(x = tamano, y = reorder(familia, tamano, FUN = median))) +
+  geom_boxplot(width = 0.55, outlier.shape = NA,
+               fill = "grey95", colour = "grey45") +
+  geom_jitter(aes(colour = tipo), height = 0.18, size = 1.1, alpha = 0.75) +
+  scale_colour_viridis_d(begin = 0.1, end = 0.7, name = NULL) +
+  scale_y_discrete(labels = abbreviate_labels) +
+  scale_x_continuous(labels = scales::comma, limits = c(0, NA),
+                     expand = expansion(mult = c(0, 0.02))) +
+  labs(x = "Element length (bp)", y = "IS family") +
+  theme(legend.position = "bottom")
+```
+
+```{r tam familia}
+tam_IS_familias |>
+  dplyr::group_by(familia) |>
+  dplyr::summarise(n = dplyr::n(),
+                   median = median(tamano),
+                   q1 = quantile(tamano, 0.25),
+                   q3 = quantile(tamano, 0.75), .groups = "drop") |>
+  dplyr::arrange(dplyr::desc(n)) |>
+  knitr::kable(caption = "Transposase length by family (bp)",
+               col.names = c("Family", "Elements", "Median", "Q1", "Q3"))
+
+# Is the size difference between replicons explained by family composition?
+tam_IS_familias |>
+  dplyr::mutate(tipo = ifelse(stringr::str_detect(replicon,
+                              stringr::regex("plasmid", ignore_case = TRUE)),
+                              "Plasmid", "Chromosome")) |>
+  dplyr::filter(familia %in% c("IS1", "IS3", "IS6", "IS66", "Tn3", "IS21")) |>
+  dplyr::group_by(familia, tipo) |>
+  dplyr::summarise(n = dplyr::n(), median = median(tamano), .groups = "drop") |>
+  tidyr::pivot_wider(names_from = tipo, values_from = c(n, median)) |>
+  knitr::kable(caption = "Element length by family and replicon type (bp)")
+```
+
+```{r figura2 , fig.height=11, fig.width=12, warning=FALSE}
+# Panel A: family x strain element counts 
+p_A <- conteos |>
+  dplyr::mutate(cepa    = factor(cepa,    levels = orden_cepas_n),
+                familia = factor(familia, levels = orden_familias_n),
+                n_plot  = ifelse(n == 0, NA, n)) |>
+  ggplot(aes(x = cepa, y = familia, fill = n_plot)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  scale_fill_viridis_c(trans = "log1p", breaks = c(1, 5, 20, 60),
+                       name = "Elements", na.value = "grey92") +
+  scale_y_discrete(labels = abbreviate_labels) +
+  labs(x = "Strain", y = "IS family") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+        axis.text.y = element_text(size = 7),
+        panel.grid  = element_blank())
+
+# Panel B: transposase density per replicon type 
+p_B <- densidad |>
+  dplyr::mutate(tipo = ifelse(tipo == "Plasmid", "Plasmid\ncontigs", "Chromosomal\ncontigs")) |>
+  ggplot(aes(x = tipo, y = densidad)) +
+  geom_line(aes(group = cepa), colour = "grey75", linewidth = 0.4) +
+  geom_point(aes(colour = tipo), size = 2, alpha = 0.85) +
+  scale_y_log10() +
+  scale_colour_viridis_d(begin = 0.1, end = 0.7, guide = "none") +
+  labs(x = NULL, y = "Transposases per Mb")
+
+# Panel C: proportion of elements on plasmid contigs, by family 
+p_C <- ggplot(enriquecimiento, aes(x = reorder(familia, prop_plasmid), y = prop_plasmid)) +
+  geom_col(fill = "#21908C") +
+  geom_hline(yintercept = prop_global, linetype = "dashed", colour = "grey40") +
+  coord_flip() +
+  scale_x_discrete(labels = abbreviate_labels) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "IS family", y = "Elements on plasmid contigs") +
+  theme(axis.text.y = element_text(size = 7))
+
+# Panel D: element length by family 
+p_D <- tam_IS_familias |>
+  dplyr::group_by(familia) |>
+  dplyr::filter(dplyr::n() >= 5) |>
+  dplyr::ungroup() |>
+  ggplot(aes(x = tamano, y = reorder(familia, tamano, FUN = median))) +
+  geom_boxplot(width = 0.55, outlier.shape = NA, fill = "grey95", colour = "grey45") +
+  geom_jitter(aes(colour = tipo), height = 0.18, size = 1, alpha = 0.8) +
+  scale_colour_viridis_d(begin = 0.1, end = 0.7, name = NULL) +
+  scale_y_discrete(labels = abbreviate_labels) +
+  scale_x_continuous(labels = scales::comma, limits = c(0, NA),
+                     expand = expansion(mult = c(0, 0.02))) +
+  labs(x = "Element length (bp)", y = "IS family") +
+  theme(axis.text.y = element_text(size = 7),
+        legend.position = "bottom")
+
+# Assemble 
+(p_A + p_B + patchwork::plot_layout(widths = c(3.4, 1))) /
+(p_C + p_D) +
+  patchwork::plot_annotation(tag_levels = "A")
+ggsave("Resultados/Figure2.jpg",
+       width = 12, height = 11, dpi = 300, quality = 100)
+```
+
+## 6. Neighboring genes of transposases
+To characterize the genomic context of transposases beyond family and replicon, we classified their immediate upstream and downstream neighbors — within 500 bp — into four categories: another transposase, a hypothetical protein, a characterized protein, or no neighbor when no gene was found within that distance, for example at a contig edge or across a large intergenic region. Because neighbor category and replicon type are both categorical variables, we assessed their association using a chi-squared test of independence on the resulting contingency table. We compared this classification between chromosomal and plasmid-predicted contigs, and identified which specific genes recur most frequently as neighbors in each replicon.
+
+```{r resumen vecinos replicon}
+# Classify each neighboring gene into 4 categories and split by replicon
+resumen_vecinos <- df %>%
+  mutate(
+    # Chromosome vs Plasmid
+    type = ifelse(str_detect(replicon, regex("plasmid", ignore_case = TRUE)),
+                  "Plasmid", "Chromosome"),
+    # Category of the neighboring gene
+    neighbor_category = case_when(
+      is.na(gen_vecino)                                                        ~ "No neighbor",
+      str_detect(gen_vecino, regex("transpos|insertion|IS\\d|integrase",
+                                   ignore_case = TRUE))                        ~ "Transposase",
+      str_detect(gen_vecino, regex("hypothetical protein",
+                                   ignore_case = TRUE))                        ~ "Hypothetical protein",
+      TRUE                                                                     ~ "Characterized protein"
+    )
+  ) %>%
+  # Count by replicon and category (each transposase contributes 2 positions: upstream and downstream)
+  group_by(type, neighbor_category) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  # Calculate percentage within each replicon
+  group_by(type) %>%
+  mutate(pct = round(100 * n / sum(n), 1))
+knitr::kable(resumen_vecinos, caption = "Neighboring positions by type, per replicon")
+```
+```{r test vecinos replicon}
+cont_table_1 <- resumen_vecinos %>%
+  select(type, neighbor_category, n) %>%
+  tidyr::pivot_wider(names_from = neighbor_category, values_from = n) %>%
+  tibble::column_to_rownames("type") %>%
+  as.matrix()
+
+chisq.test(cont_table_1)
+```
+
+```{r figura vecinos replicon}
+ggplot(resumen_vecinos, aes(x = type, y = pct, fill = neighbor_category)) +
+  geom_col(width = 0.5) +
+  geom_text(aes(label = ifelse(pct > 8, paste0(pct, "%\n(n=", n, ")"), "")),
+            position = position_stack(vjust = 0.5),
+            size = 3.5, fontface = "bold", color = "white") +
+  scale_fill_viridis_d(name = "Category") +
+  labs(x = "", y = "Percentage (%)") +
+  theme(legend.position = "bottom")
+```
+
+```{r recurrencia vecinos}
+# For each neighboring gene and replicon, calculate how many samples have it and how many times it appears in total as a neighbor of some transposase
+recurrencia_raw <- trans_long %>%
+  group_by(gen_vecino, replicon) %>%
+  summarise(
+    n_muestras    = n_distinct(Muestra),   
+    n_ocurrencias = n(),                    
+    familias      = paste(sort(unique(familia)), collapse = "; "), 
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_muestras))               
+# Split by replicon and sort by occurrences
+tabla_chr <- recurrencia_raw %>%
+  filter(str_detect(replicon, regex("chromosome", ignore_case = TRUE))) %>%
+  arrange(desc(n_ocurrencias))
+tabla_plas <- recurrencia_raw %>%
+  filter(str_detect(replicon, regex("plasmid", ignore_case = TRUE))) %>%
+  arrange(desc(n_ocurrencias))
+# Top 10 per replicon
+knitr::kable(head(tabla_chr, 10) %>% select(-replicon),
+             caption = "Top 10 neighbors in Chromosome", booktabs = TRUE,
+             col.names = c("Neighbor gene", "N samples", "N occurrences", "Families"))
+knitr::kable(head(tabla_plas, 10) %>% select(-replicon),
+             caption = "Top 10 neighbors in Plasmid", booktabs = TRUE,
+             col.names = c("Neighbor gene", "N samples", "N occurrences", "Families"))
+```
+
+```{r recurrencia vecinos filtrada}
+# Filter out NAs and other transposase genes
+tabla_chr_filtrada <- tabla_chr %>%
+  filter(!is.na(gen_vecino),
+         !grepl("transposase|transposasa|resolvase|^Transposon Tn",
+                gen_vecino, ignore.case = TRUE))
+tabla_plas_filtrada <- tabla_plas %>%
+  filter(!is.na(gen_vecino),
+         !grepl("transposase|transposasa|resolvase|^Transposon Tn",
+                gen_vecino, ignore.case = TRUE))
+# Top 15 per replicon
+knitr::kable(head(tabla_chr_filtrada, 15) %>% select(-replicon),
+             caption  = "Top 15 neighbors in Chromosome (excluding NA and transposases)",
+             booktabs = TRUE,
+             col.names = c("Neighbor gene", "N samples", "N occurrences", "Families"))
+knitr::kable(head(tabla_plas_filtrada, 15) %>% select(-replicon),
+             caption  = "Top 15 neighbors in Plasmid (excluding NA and transposases)",
+             booktabs = TRUE,
+             col.names = c("Neighbor gene", "N samples", "N occurrences", "Families"))
+```
+
+```{r most freq neib}
+tabla_recurrencia_combinada <- dplyr::bind_rows(
+  tabla_chr_filtrada %>% dplyr::slice_head(n = 15),
+  tabla_plas_filtrada %>% dplyr::slice_head(n = 15)
+) %>%
+  dplyr::relocate(replicon, .before = gen_vecino)
+
+readr::write_excel_csv2(tabla_recurrencia_combinada, "Resultados/Supplementary_Table_S2.csv")
+
+knitr::kable(tabla_recurrencia_combinada,
+             caption = "Most frequent transposase neighbors by replicon",
+             col.names = c("Replicon", "Neighbor gene", "N strains", "N occurrences", "Families"))
+```
+
+
+## 7. Functional classification of the transposase neighborhood
+To characterize the type of genes flanking transposases, all functional neighboring genes (hypothetical proteins excluded) were classified into seven categories according to function. The antibiotic resistance category was identified using the Resistance Gene Identifier (RGI), the official tool of the CARD database. The protein sequences of the 2340 non-hypothetical neighboring genes were extracted from the 28 GenBank files and analyzed with RGI 6.0.5 (CARD 4.0.1) in protein mode, using DIAMOND-based homology detection and CARD's curated bitscore cutoffs (Perfect + Strict criterion).
+
+Sequence-homology-based identification was chosen over gene-name matching to avoid the mismatch between Prokka's descriptive nomenclature and CARD's technical identifiers; RGI compares protein sequences directly against CARD models, so the original annotation does not bias the result. Hits were then cross-referenced with each locus's Prokka product name to integrate them into the rest of the analysis.
+
+Antibiotic resistance was the only category validated against a curated database, since it bears directly on this thesis's central question and CARD is the field-standard resource for that purpose. The remaining six categories describe the broader functional landscape rather than testing a specific hypothesis, and were assigned from curated keyword sets applied to each gene's Prokka annotation and best read as a descriptive summary rather than a validated classification. Because functional category and replicon type are both categorical variables, we assessed their association using a chi-squared test of independence, applying Fisher's exact test with Monte Carlo simulation instead when expected cell counts were low."
+
+```{r vecinos candidatos}
+# Candidate neighbors (no hypothetical, no duplicates per strain)
+vec_raw <- trans_long %>%
+  filter(!is.na(locus_vecino), !is.na(gen_vecino),
+         !grepl("hypothetical protein", gen_vecino, ignore.case = TRUE)) %>%
+  mutate(cepa = str_extract(Muestra, "^[^_]+")) %>%
+  distinct(cepa, locus_vecino, gen_vecino, replicon)
+```
+
+```{r extraer prot vecinas, message=FALSE, warning=FALSE}
+# Extract protein sequences from the .gbk files
+extraer_proteinas <- function(gbk_path) {
+  cepa <- str_extract(basename(gbk_path), "^[^_]+")
+  loci <- vec_raw %>% filter(cepa == !!cepa) %>% dplyr::pull(locus_vecino) %>% unique()
+  if (length(loci) == 0) return(tibble())
+  contenido <- paste(readLines(gbk_path, warn = FALSE), collapse = "\n")
+  bloques   <- str_split(contenido, "\n     CDS ")[[1]][-1]
+  map_dfr(bloques, function(b) {
+    locus_m <- str_match(b, '/locus_tag="([^"]+)"')[,2]
+    if (is.na(locus_m) || !(locus_m %in% loci)) return(NULL)
+    trans_m <- str_match(b, '/translation="([^"]+)"')[,2]
+    if (is.na(trans_m)) return(NULL)
+    tibble(cepa, locus_tag = locus_m, seq = str_remove_all(trans_m, "\\s+"))
+  })
+}
+proteinas <- map_dfr(archivosGENBANK, extraer_proteinas)
+cat("Extracted proteins:", nrow(proteinas), "\n")
+
+# Export to FASTA (RGI input)
+aa <- AAStringSet(proteinas$seq)
+names(aa) <- paste(proteinas$cepa, proteinas$locus_tag, sep = "|")
+writeXStringSet(aa, "Resultados/proteinas_vecinas_CARD.fasta")
+```
+
+```{r cargar rgi}
+# Load RGI results (CARD 4.0.1, Perfect+Strict criterion)
+# RGI names its output after the run date; read the single .txt file in the folder
+archivo_rgi <- list.files("Resultados/Resultado_RGI", pattern = "\\.txt$", full.names = TRUE)
+stopifnot(length(archivo_rgi) == 1)
+rgi <- read_tsv(archivo_rgi, show_col_types = FALSE)
+
+# Build hits_card from RGI
+hits_card <- rgi %>%
+  transmute(cepa       = str_extract(ORF_ID, "^[^|]+"),
+            locus_tag  = str_trim(str_extract(ORF_ID, "(?<=\\|)\\S+")),
+            card_name  = Best_Hit_ARO,
+            cutoff     = Cut_Off,
+            drug_class = `Drug Class`,
+            mechanism  = `Resistance Mechanism`) %>%
+  distinct()
+
+cat("CARD hits (RGI):", nrow(hits_card), "\n")
+cat("Unique genes:", n_distinct(hits_card$card_name), "\n")
+cat("Strains with a hit:", n_distinct(hits_card$cepa), "/28\n")
+
+# Cross-reference hits with the neighboring gene name
+gen_vecino_card <- hits_card %>%
+  left_join(vec_raw, by = c("cepa", "locus_tag" = "locus_vecino")) %>%
+  distinct(gen_vecino) %>%
+  filter(!is.na(gen_vecino)) %>%
+  dplyr::pull(gen_vecino)
+cat("Neighboring genes validated by CARD:", length(gen_vecino_card), "\n")
+```
+```{r tabla resistencia card}
+tabla_resistencia_card <- hits_card %>%
+  left_join(vec_raw, by = c("cepa", "locus_tag" = "locus_vecino")) %>%
+  filter(!is.na(gen_vecino)) %>%
+  mutate(tipo = ifelse(str_detect(replicon, regex("plasmid", ignore_case = TRUE)),
+                        "Plasmid", "Chromosome")) %>%
+  group_by(card_name, drug_class, mechanism) %>%
+  summarise(
+    n_strains = n_distinct(cepa),
+    replicons = paste(sort(unique(tipo)), collapse = " & "),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_strains)) %>%
+  mutate(drug_class = ifelse(str_count(drug_class, ";") + 1 > 3,
+                              "Multidrug efflux",
+                              drug_class))
+
+write.csv2(tabla_resistencia_card, "Resultados/Table_1.csv", row.names = FALSE)
+
+knitr::kable(tabla_resistencia_card,
+             caption = "Antibiotic resistance genes identified among transposase neighbors (CARD/RGI, Perfect+Strict)",
+             col.names = c("Gene", "Drug class", "Resistance mechanism", "N strains", "Replicon(s)"))
+```
+
+```{r vecindario funcional}
+vecindario <- bind_rows(
+  tabla_chr_filtrada %>% mutate(tipo = "Chromosome"),
+  tabla_plas_filtrada %>% mutate(tipo = "Plasmid")
+) %>%
+  filter(!is.na(gen_vecino),
+         !grepl("hypothetical protein", gen_vecino, ignore.case = TRUE),
+         !grepl("insertion sequence|integrase|rep-associated", gen_vecino, ignore.case = TRUE))
+
+clasificar_funcion <- function(gen) {
+  case_when(
+    # 1. Resistance — validated by homology against CARD v4.0.1
+    gen %in% gen_vecino_card ~ "Resistance",
+    # 2. Virulence and adherence
+    grepl("fimbri|pilin|pilus|pili|adhesin|antigen 43|hemolysin|leukotoxin|serine protease Esp|serine protease sat|autotransporter|IcsA|surface presentation|Spa[OS]|colicin|virulence|VirB|VirF|HilA|invasion|pathogen|toxin secretion|type III|type IV secretion|PapC|PapE|PapG|FimD|FimF|FimG|fimbrial|S-fimbrial|PAP fimbrial|fimbrial adhesin",
+          gen, ignore.case = TRUE) ~ "Virulence/Adherence",
+    # 3. Toxin-antitoxin and SOS response
+    grepl("toxic protein|antitoxin|endoribonuclease Pem|MqsA|CbeA|GhoS|orphan toxin|small toxic|UmuC|SOS response|DNA damage-inducible|ldr[A-Z]|Hok[A-Z]|PemK",
+          gen, ignore.case = TRUE) ~ "Toxin-Antitoxin/SOS",
+    # 4. Plasmid maintenance and mobility
+    grepl("RepA|plasmid segregation|FlmC|fertility inhibition|TraD|TraI|TraY|TraC|TraQ|relaxosome|origin-binding|replicative DNA helicase|tyrosine recombinase|serine recombinase|prophage integrase|antirestriction|conjugation|mobilization|ParM|plasmid partition|StbB|conjugal transfer",
+          gen, ignore.case = TRUE) ~ "Plasmid maintenance",
+    # 5. Transcriptional regulation
+    grepl("HTH-type|transcriptional regulator|transcriptional activator|transcriptional repressor|repressor|RNA polymerase sigma|H-NS|sensor protein|ArcA|two-component|regulatory protein|operon.*regul|regul.*operon",
+          gen, ignore.case = TRUE) ~ "Regulation",
+    # 6. Metabolism
+    grepl("dehydrogenase|synthase|reductase|hydratase|transferase|aldolase|kinase|ligase|hydrolase|lyase|epimerase|phosphatase|oxidoreductase|enolase|permease|transporter|symporter|antiporter|decarboxylase|isomerase|mutase|carboxylase|synthetase|deaminase|hydroxylase|lactonase|racemase|dehydratase|methyltransferase|glucosyltransferase|glycosyltransferase|acetyltransferase|acyltransferase|aminotransferase|phosphorylase|esterase|peptidase|protease|nucleosidase|nucleotidase|lipase|sulfatase|desaturase|oxidase",
+          gen, ignore.case = TRUE) ~ "Metabolism",
+    # 7. Other functional
+    TRUE ~ "Other functional"
+  )
+}
+
+vecindario_clasificado <- vecindario %>%
+  mutate(categoria = clasificar_funcion(gen_vecino),
+         categoria = factor(categoria, levels = c(
+           "Resistance", "Metabolism", "Regulation", "Other functional",
+           "Toxin-Antitoxin/SOS", "Virulence/Adherence", "Plasmid maintenance"
+         )))
+
+vecindario_pct <- vecindario_clasificado %>%
+  group_by(tipo, categoria) %>%
+  summarise(total_ocurrencias = sum(n_ocurrencias), .groups = "drop") %>%
+  group_by(tipo) %>%
+  mutate(pct = total_ocurrencias / sum(total_ocurrencias))
+
+ggplot(vecindario_pct, aes(x = tipo, y = pct, fill = categoria)) +
+  geom_col(width = 0.55) +
+  geom_text(aes(label = ifelse(pct >= 0.01, scales::percent(pct, accuracy = 0.1), "")),
+            position = position_stack(vjust = 0.5),
+            size = 3.2, color = "white", fontface = "bold") +
+  scale_fill_viridis_d(name = "Functional category") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "", y = "Proportion of occurrences (%)") +
+  theme(legend.position = "right",
+        legend.key.size = unit(0.45, "cm"),
+        legend.text     = element_text(size = 9))
+```
+
+```{r tabla s1}
+# Supplementary Table S1. keyword/regex term lists used to assign the non-Resistance functional categories (Section 2.6, Materials and Methods)
+
+terminos_regex <- list(
+  "Virulence/Adherence" = paste(
+    "fimbri", "pilin", "pilus", "pili", "adhesin", "antigen 43", "hemolysin",
+    "leukotoxin", "serine protease Esp", "serine protease sat", "autotransporter",
+    "IcsA", "surface presentation", "Spa[OS]", "colicin", "virulence", "VirB",
+    "VirF", "HilA", "invasion", "pathogen", "toxin secretion", "type III",
+    "type IV secretion", "PapC", "PapE", "PapG", "FimD", "FimF", "FimG",
+    "fimbrial", "S-fimbrial", "PAP fimbrial", "fimbrial adhesin",
+    sep = "|"
+  ),
+  "Toxin-Antitoxin/SOS" = paste(
+    "toxic protein", "antitoxin", "endoribonuclease Pem", "MqsA", "CbeA",
+    "GhoS", "orphan toxin", "small toxic", "UmuC", "SOS response",
+    "DNA damage-inducible", "ldr[A-Z]", "Hok[A-Z]", "PemK",
+    sep = "|"
+  ),
+  "Plasmid maintenance" = paste(
+    "RepA", "plasmid segregation", "FlmC", "fertility inhibition", "TraD",
+    "TraI", "TraY", "TraC", "TraQ", "relaxosome", "origin-binding",
+    "replicative DNA helicase", "tyrosine recombinase", "serine recombinase",
+    "prophage integrase", "antirestriction", "conjugation", "mobilization",
+    "ParM", "plasmid partition", "StbB", "conjugal transfer",
+    sep = "|"
+  ),
+  "Regulation" = paste(
+    "HTH-type", "transcriptional regulator", "transcriptional activator",
+    "transcriptional repressor", "repressor", "RNA polymerase sigma", "H-NS",
+    "sensor protein", "ArcA", "two-component", "regulatory protein",
+    "operon.*regul", "regul.*operon",
+    sep = "|"
+  ),
+  "Metabolism" = paste(
+    "dehydrogenase", "synthase", "reductase", "hydratase", "transferase",
+    "aldolase", "kinase", "ligase", "hydrolase", "lyase", "epimerase",
+    "phosphatase", "oxidoreductase", "enolase", "permease", "transporter",
+    "symporter", "antiporter", "decarboxylase", "isomerase", "mutase",
+    "carboxylase", "synthetase", "deaminase", "hydroxylase", "lactonase",
+    "racemase", "dehydratase", "methyltransferase", "glucosyltransferase",
+    "glycosyltransferase", "acetyltransferase", "acyltransferase",
+    "aminotransferase", "phosphorylase", "esterase", "peptidase", "protease",
+    "nucleosidase", "nucleotidase", "lipase", "sulfatase", "desaturase",
+    "oxidase",
+    sep = "|"
+  )
+)
+
+# long format
+tabla_s1 <- purrr::imap_dfr(terminos_regex, function(patron, categoria) {
+  tibble::tibble(
+    Category = categoria,
+    Term     = stringr::str_split(patron, "\\|")[[1]]
+  )
+})
+
+tabla_s1 <- dplyr::bind_rows(
+  tabla_s1,
+  tibble::tibble(
+    Category = "Other functional",
+    Term     = "(catch-all: any functional neighbouring gene matching none of the categories above)"
+  )
+)
+
+write.csv2(tabla_s1, "Resultados/Supplementary_Table_S1.csv",
+           row.names = FALSE, fileEncoding = "UTF-8")
+
+```
+
+```{r test vecindario funcional}
+cont_table_2 <- vecindario_clasificado %>%
+  dplyr::count(tipo, categoria) %>%
+  tidyr::pivot_wider(names_from = categoria, values_from = n, values_fill = 0) %>%
+  tibble::column_to_rownames("tipo") %>%
+  as.matrix()
+
+chisq.test(cont_table_2)
+fisher.test(cont_table_2, simulate.p.value = TRUE, B = 10000)
+```
+
+```{r tabla vecindario funcional}
+vecindario_clasificado %>%
+  group_by(tipo, categoria) %>%
+  summarise(n_genes = n(),
+            total_ocurrencias = sum(n_ocurrencias), .groups = "drop") %>%
+  group_by(tipo) %>%
+  mutate(pct = scales::percent(total_ocurrencias / sum(total_ocurrencias), accuracy = 0.1)) %>%
+  arrange(tipo, desc(total_ocurrencias)) %>%
+  knitr::kable(caption = "Functional classification of the neighborhood by replicon",
+               col.names = c("Replicon", "Category", "N unique genes", "N occurrences", "%"))
+```
+
+```{r figura3-completa, fig.height=7.5, fig.width=11, warning=FALSE}
+
+vecindario_pct <- vecindario_pct %>%
+  arrange(tipo, categoria) %>%
+  group_by(tipo) %>%
+  mutate(ypos = 1 - (cumsum(pct) - pct / 2)) %>%
+  ungroup()
+
+label_threshold <- 0.035
+
+# segments large enough to hold a label inside the bar
+vec_big <- vecindario_pct %>% filter(pct >= label_threshold)
+
+# label pushed outside the bar, with a line
+vec_small <- vecindario_pct %>%
+  filter(pct < label_threshold) %>%
+  mutate(x_num   = as.numeric(factor(tipo, levels = c("Chromosome", "Plasmid"))),
+         x_label = x_num + 0.42)
+
+p_A <- ggplot(resumen_vecinos, aes(x = type, y = pct, fill = neighbor_category)) +
+  geom_col(width = 0.5) +
+  geom_text(aes(label = ifelse(pct > 8, paste0(pct, "%\n(n=", n, ")"), "")),
+            position = position_stack(vjust = 0.5),
+            size = 3, fontface = "bold", color = "white") +
+  scale_fill_viridis_d(name = "Category") +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+  labs(x = "", y = "Percentage (%)") +
+  theme(legend.position = "bottom",
+        legend.text  = element_text(size = 7),
+        legend.title = element_text(size = 8))
+
+p_B <- ggplot(vecindario_pct, aes(x = tipo, y = pct, fill = categoria)) +
+  geom_col(width = 0.55) +
+  geom_text(data = vec_big,
+            aes(y = ypos, label = scales::percent(pct, accuracy = 0.1)),
+            size = 2.8, fontface = "bold", color = "white") +
+  geom_segment(data = vec_small,
+               aes(x = x_num + 0.28, xend = x_label - 0.05, y = ypos, yend = ypos),
+               color = "grey30", linewidth = 0.3, inherit.aes = FALSE) +
+  geom_text(data = vec_small,
+            aes(x = x_label, y = ypos, label = scales::percent(pct, accuracy = 0.1)),
+            size = 2.5, hjust = 0, color = "black", inherit.aes = FALSE) +
+  scale_fill_viridis_d(name = "Functional category") +
+  scale_x_discrete(expand = expansion(add = c(0.6, 1))) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "", y = "Proportion of occurrences (%)") +
+  theme(legend.position = "right",
+        legend.text     = element_text(size = 7),
+        legend.key.size = unit(0.4, "cm"))
+
+p_A + p_B +
+  patchwork::plot_layout(widths = c(1, 1.4)) +
+  patchwork::plot_annotation(tag_levels = "A")
+
+ggsave("Resultados/Figure3.jpg", width = 11, height = 7.5, dpi = 300, quality = 100)
+```
+
+
+## 8. Transposase-associated hypomethylation — Dam methylome
+To characterize the relationship between Dam methylation and transposases, we assessed hypomethylation within a defined window around each element. Sites with a methylation score ≤ 0.5 were considered hypomethylated. For each transposase, a ±200 bp window around its coordinates was defined, and every hypomethylated site within that window was classified as upstream, downstream, or intra according to its position relative to the element. Because the windows of nearby transposases can overlap, a single hypomethylated site may be associated with more than one transposase; counts therefore reflect site-transposase relationships rather than unique physical sites in the genome. In two of the 28 strains (DA63796, DA63960), replicon-level analyses showed very little or no hypomethylation signal in some regions, possibly due to a technical limitation in methylome generation for these samples; both strains are therefore underrepresented in the results that follow.
+
+```{r cargar datos dam}
+tsv_raw <- read_tsv("Resultados/vecinos_LONG_raw.tsv",
+                    show_col_types = FALSE) %>%
+  mutate(cepa = str_extract(Muestra, "^[^_]+"))
+
+ventanasmeti <- tsv_raw %>%
+  distinct(cepa, locus_tag, start, end, contig, replicon, familia) %>%
+  mutate(start_ext200 = start - 200,
+         end_ext200 = end + 200)
+
+vecinos_meti <- tsv_raw %>%
+  select(cepa, locus_tag, posicion, gen_vecino, locus_vecino, distancia)
+```
+
+```{r parsear wig dam}
+carpeta_wig <- "Datos/metilomas"
+archivos_dam <- list.files(carpeta_wig, pattern = "_dam\\.dampened.*\\.wig$", full.names = TRUE)
+
+# Parser: captures the contig (chrom=) of each block, vectorized
+wig_dam <- map_dfr(archivos_dam, function(f) {
+  cepa  <- str_extract(basename(f), "^[^_]+")
+  hebra <- ifelse(grepl("plus", f), "+", "-")
+  lineas <- readLines(f)
+  es_header <- grepl("^variableStep", lineas)
+  idx_header <- cumsum(es_header)
+  chrom_por_bloque <- str_match(lineas[es_header], "chrom=(\\S+)")[, 2]
+  chrom_por_bloque <- str_extract(chrom_por_bloque, "\\d+")
+  contig_vec <- ifelse(idx_header > 0, chrom_por_bloque[idx_header], NA_character_)
+  es_dato <- !es_header & !grepl("^track", lineas) & lineas != ""
+  df <- read.table(text = lineas[es_dato], col.names = c("pos", "score"))
+  df$contig_num <- contig_vec[es_dato]
+  df$cepa  <- cepa
+  df$hebra <- hebra
+  df
+}) %>%
+  filter(score <= 0.5)
+```
+
+```{r cruce dam ventanas}
+# Join: by strain + contig number (the wig's "1" matches the gbk's "_1")
+resultado_dam <- wig_dam %>%
+  inner_join(
+    ventanasmeti %>% mutate(contig_num = str_extract(contig, "[0-9]+$")),
+    by = c("cepa", "contig_num"),
+    relationship = "many-to-many"
+  ) %>%
+  filter(pos >= start_ext200, pos <= end_ext200) %>%
+  mutate(zona = case_when(
+    pos < start ~ "upstream",
+    pos > end   ~ "downstream",
+    TRUE        ~ "intra"
+  ))
+```
+
+```{r tabla zona replicon dam}
+resultado_dam %>%
+  dplyr::count(zona, replicon) %>%
+  knitr::kable(caption = "Dam hypomethylation by zone and replicon",
+               col.names = c("Zone", "Replicon", "N"))
+```
+
+```{r figura zona replicon dam}
+resultado_dam %>%
+  dplyr::count(zona, replicon) %>%
+  ggplot(aes(x = zona, y = n, fill = replicon)) +
+  geom_col(position = "dodge") +
+  scale_fill_viridis_d(name = "Replicon") +
+  labs(x = "Zone", y = "N hypomethylations")
+```
+
+```{r figura distribucion zona replicon dam}
+resultado_dam %>%
+  dplyr::count(zona, replicon) %>%
+  group_by(replicon) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = replicon, y = prop, fill = zona)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_viridis_d(name = "Zone") +
+  labs(x = "Replicon", y = "Proportion")
+```
+
+```{r vecinos hipometilados dam, }
+resultado_con_vecinos <- resultado_dam %>%
+  left_join(vecinos_meti, by = c("cepa", "locus_tag", "zona" = "posicion"))
+
+resultado_con_vecinos %>%
+  filter(!is.na(gen_vecino),
+         !grepl("transposase|transposon|invertase|hypothetical", gen_vecino, ignore.case = TRUE)) %>%
+  group_by(gen_vecino, replicon) %>%
+  summarise(n = n(), n_cepas = n_distinct(cepa), .groups = "drop") %>%
+  arrange(replicon, desc(n_cepas)) %>%
+  knitr::kable(caption = "Functional neighbor genes with hypomethylation by replicon (dam)",
+               col.names = c("Neighbor gene", "Replicon", "N observations", "N strains"))
+```
+
+```{r tabla familia replicon dam}
+resultado_dam %>%
+  dplyr::count(familia, replicon) %>%
+  arrange(desc(n)) %>%
+  knitr::kable(caption = "Dam hypomethylation by transposase family and replicon",
+               col.names = c("Family", "Replicon", "N"))
+```
+
+```{r vecinos regulatorios dam}
+cepas_por_gen <- resultado_con_vecinos %>%
+  filter(!is.na(gen_vecino),
+         !grepl("transposase|transposon|invertase|hypothetical", gen_vecino, ignore.case = TRUE),
+         zona != "intra") %>%
+  group_by(gen_vecino, replicon) %>%
+  summarise(n_cepas_total = n_distinct(cepa), .groups = "drop")
+
+resultado_con_vecinos %>%
+  filter(!is.na(gen_vecino),
+         !grepl("transposase|transposon|invertase|hypothetical", gen_vecino, ignore.case = TRUE),
+         zona != "intra") %>%
+  group_by(gen_vecino, replicon, zona) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = zona, values_from = n, values_fill = 0) %>%
+  left_join(cepas_por_gen, by = c("gen_vecino", "replicon")) %>%
+  mutate(total = upstream + downstream) %>%
+  filter(n_cepas_total >= 2) %>%
+  arrange(replicon, desc(n_cepas_total)) %>%
+  select(gen_vecino, replicon, downstream, upstream, n_cepas_total, total) %>%
+  knitr::kable(caption = "Neighbor genes with regulatory hypomethylation (up/down) in at least 2 strains (dam)",
+               col.names = c("Neighbor gene", "Replicon", "Downstream", "Upstream", "N strains", "Total"))
+```
+
+## 9. Transposase-associated hypomethylation — Dcm methylome
+The same approach was applied to Dcm methylation, using the CCWGG motif and the same 0.5 score threshold and ±200 bp window definition described above. As with Dam, DA63796 and DA63960 remain underrepresented in the replicon-level analyses below. To compare the overall proportion of hypomethylation between chromosome and plasmid while controlling for pseudoreplication, data were first aggregated by strain, yielding one hypomethylation proportion per strain and replicon; because each strain contributes both a chromosome and a plasmid value, this comparison is inherently paired rather than between independent groups. A Shapiro-Wilk test showed that the hypomethylation proportion did not follow a normal distribution in either replicon (p<0.0001 for both), so a paired Wilcoxon signed-rank test was used, together with the matched-pairs rank-biserial correlation as the effect size measure.
+
+```{r parsear wig dcm}
+archivos_dcm <- list.files(carpeta_wig, pattern = "_dcm\\.dampened.*\\.wig$", full.names = TRUE)
+
+# Parser: captures the contig (chrom=) of each block
+wig_dcm <- map_dfr(archivos_dcm, function(f) {
+  cepa  <- str_extract(basename(f), "^[^_]+")
+  hebra <- ifelse(grepl("plus", f), "+", "-")
+  lineas <- readLines(f)
+  es_header <- grepl("^variableStep", lineas)
+  idx_header <- cumsum(es_header)
+  chrom_por_bloque <- str_match(lineas[es_header], "chrom=(\\S+)")[, 2]
+  chrom_por_bloque <- str_extract(chrom_por_bloque, "\\d+")
+  contig_vec <- ifelse(idx_header > 0, chrom_por_bloque[idx_header], NA_character_)
+  es_dato <- !es_header & !grepl("^track", lineas) & lineas != ""
+  df <- read.table(text = lineas[es_dato], col.names = c("pos", "score"))
+  df$contig_num <- contig_vec[es_dato]
+  df$cepa  <- cepa
+  df$hebra <- hebra
+  df
+}) %>%
+  filter(score <= 0.5)
+```
+
+```{r cruce dcm ventanas}
+# Join: by strain + contig number 
+resultado_dcm <- wig_dcm %>%
+  inner_join(
+    ventanasmeti %>% mutate(contig_num = str_extract(contig, "[0-9]+$")),
+    by = c("cepa", "contig_num"),
+    relationship = "many-to-many"
+  ) %>%
+  filter(pos >= start_ext200, pos <= end_ext200) %>%
+  mutate(zona = case_when(
+    pos < start ~ "upstream",
+    pos > end   ~ "downstream",
+    TRUE        ~ "intra"
+  ))
+```
+
+```{r tabla zona replicon dcm}
+resultado_dcm %>%
+  dplyr::count(zona, replicon) %>%
+  knitr::kable(caption = "Dcm hypomethylation by zone and replicon",
+               col.names = c("Zone", "Replicon", "N"))
+```
+
+```{r figura zona replicon dcm}
+resultado_dcm %>%
+  dplyr::count(zona, replicon) %>%
+  ggplot(aes(x = zona, y = n, fill = replicon)) +
+  geom_col(position = "dodge") +
+  scale_fill_viridis_d(name = "Replicon") +
+  labs(x = "Zone", y = "N hypomethylations")
+```
+
+```{r figura distribucion zona replicon dcm}
+resultado_dcm %>%
+  dplyr::count(zona, replicon) %>%
+  group_by(replicon) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = replicon, y = prop, fill = zona)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_viridis_d(name = "Zone") +
+  labs(x = "Replicon", y = "Proportion")
+```
+
+```{r vecinos hipometilados dcm}
+resultado_con_vecinos_dcm <- resultado_dcm %>%
+  left_join(vecinos_meti, by = c("cepa", "locus_tag", "zona" = "posicion"))
+
+resultado_con_vecinos_dcm %>%
+  filter(!is.na(gen_vecino),
+         !grepl("transposase|transposon|invertase|hypothetical", gen_vecino, ignore.case = TRUE)) %>%
+  group_by(gen_vecino, replicon) %>%
+  summarise(n = n(), n_cepas = n_distinct(cepa), .groups = "drop") %>%
+  arrange(replicon, desc(n_cepas)) %>%
+  knitr::kable(caption = "Functional neighbor genes with hypomethylation by replicon (dcm)",
+               col.names = c("Neighbor gene", "Replicon", "N observations", "N strains"))
+```
+
+```{r tabla familia replicon dcm}
+resultado_dcm %>%
+  dplyr::count(familia, replicon) %>%
+  arrange(desc(n)) %>%
+  knitr::kable(caption = "Dcm hypomethylation by transposase family and replicon",
+               col.names = c("Family", "Replicon", "N"))
+```
+
+```{r vecinos regulatorios dcm}
+cepas_por_gen_dcm <- resultado_con_vecinos_dcm %>%
+  filter(!is.na(gen_vecino),
+         !grepl("transposase|transposon|invertase|hypothetical", gen_vecino, ignore.case = TRUE),
+         zona != "intra") %>%
+  group_by(gen_vecino, replicon) %>%
+  summarise(n_cepas_total = n_distinct(cepa), .groups = "drop")
+
+resultado_con_vecinos_dcm %>%
+  filter(!is.na(gen_vecino),
+         !grepl("transposase|transposon|invertase|hypothetical", gen_vecino, ignore.case = TRUE),
+         zona != "intra") %>%
+  group_by(gen_vecino, replicon, zona) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = zona, values_from = n, values_fill = 0) %>%
+  left_join(cepas_por_gen_dcm, by = c("gen_vecino", "replicon")) %>%
+  mutate(total = upstream + downstream) %>%
+  filter(n_cepas_total >= 2) %>%
+  arrange(replicon, desc(n_cepas_total)) %>%
+  select(gen_vecino, replicon, downstream, upstream, n_cepas_total, total) %>%
+  knitr::kable(caption = "Neighbor genes with regulatory hypomethylation (up/down) in at least 2 strains (dcm)",
+               col.names = c("Neighbor gene", "Replicon", "Downstream", "Upstream", "N strains", "Total"))
+```
+
+```{r figura hipo hiper enzima, warning=FALSE}
+# Parser (not filtered: want all motifs)
+leer_wig_full <- function(f) {
+  cepa  <- str_extract(basename(f), "^[^_]+")
+  hebra <- ifelse(grepl("plus", f), "+", "-")
+  lineas <- readLines(f)
+  es_header <- grepl("^variableStep", lineas)
+  idx_header <- cumsum(es_header)
+  chrom_por_bloque <- str_match(lineas[es_header], "chrom=(\\S+)")[, 2]
+  chrom_por_bloque <- str_extract(chrom_por_bloque, "\\d+")
+  contig_vec <- ifelse(idx_header > 0, chrom_por_bloque[idx_header], NA_character_)
+  es_dato <- !es_header & !grepl("^track", lineas) & lineas != ""
+  df <- read.table(text = lineas[es_dato], col.names = c("pos", "score"))
+  df$contig_num <- contig_vec[es_dato]
+  df$cepa  <- cepa
+  df$hebra <- hebra
+  df
+}
+wig_dam_full <- map_dfr(archivos_dam, leer_wig_full)
+wig_dcm_full <- map_dfr(archivos_dcm, leer_wig_full)
+ventanas_cn <- ventanasmeti %>% mutate(contig_num = str_extract(contig, "[0-9]+$"))
+
+buscar_motivos_ventana <- function(wig_full) {
+  map_dfr(unique(ventanas_cn$cepa), function(cc) {
+    wig_full %>%
+      filter(cepa == cc) %>%
+      inner_join(filter(ventanas_cn, cepa == cc),
+                 by = c("cepa", "contig_num"),
+                 relationship = "many-to-many") %>%
+      filter(pos >= start_ext200, pos <= end_ext200) %>%
+      distinct(cepa, contig_num, pos, score, hebra, replicon)
+  })
+}
+resultado_dam_full <- buscar_motivos_ventana(wig_dam_full)
+resultado_dcm_full <- buscar_motivos_ventana(wig_dcm_full)
+
+datos_hipo_hiper <- bind_rows(
+  resultado_dam_full %>% mutate(enzima = "Dam"),
+  resultado_dcm_full %>% mutate(enzima = "Dcm")
+) %>%
+  mutate(metilacion = ifelse(score <= 0.5, "Hypomethylated", "Hypermethylated")) %>%
+  group_by(enzima, replicon, metilacion) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(enzima, replicon) %>%
+  mutate(pct = n / sum(n))
+
+ggplot(datos_hipo_hiper, aes(x = enzima, y = pct, fill = metilacion)) +
+  geom_col(position = "fill", width = 0.6) +
+  geom_text(aes(label = scales::percent(pct, accuracy = 0.1)),
+            position = position_fill(vjust = 0.5),
+            size = 3.5, color = "white", fontface = "bold") +
+  facet_wrap(~replicon) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_viridis_d(name = "") +
+  labs(x = "Enzyme", y = "Proportion")
+```
+
+```{r figura hipo hiper global}
+datos_hipo_hiper_global <- bind_rows(
+  resultado_dam_full %>% mutate(enzima = "Dam"),
+  resultado_dcm_full %>% mutate(enzima = "Dcm")
+) %>%
+  mutate(metilacion = ifelse(score <= 0.5, "Hypomethylated", "Hypermethylated")) %>%
+  distinct(cepa, contig_num, pos, enzima, replicon, metilacion) %>%
+  group_by(replicon, metilacion) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(replicon) %>%
+  mutate(pct = n / sum(n))
+
+ggplot(datos_hipo_hiper_global, aes(x = replicon, y = pct, fill = metilacion)) +
+  geom_col(position = "fill", width = 0.5) +
+  geom_text(aes(label = scales::percent(pct, accuracy = 0.1)),
+            position = position_fill(vjust = 0.5),
+            size = 4, color = "white", fontface = "bold") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_viridis_d(name = "") +
+  labs(x = "", y = "Proportion")
+```
+
+```{r}
+# Per-strain aggregation to avoid pseudoreplication (same as section 5)
+datos_hipo_hiper_cepa <- bind_rows(
+  resultado_dam_full %>% mutate(enzima = "Dam"),
+  resultado_dcm_full %>% mutate(enzima = "Dcm")
+) %>%
+  mutate(metilacion = ifelse(score <= 0.5, "Hypomethylated", "Hypermethylated")) %>%
+  distinct(cepa, contig_num, pos, enzima, replicon, metilacion)
+
+prop_hipo_cepa <- datos_hipo_hiper_cepa %>%
+  group_by(cepa, replicon) %>%
+  summarise(n_total   = n(),
+            n_hipo    = sum(metilacion == "Hypomethylated"),
+            prop_hipo = n_hipo / n_total,
+            .groups = "drop")
+
+prop_hipo_cepa %>%
+  group_by(replicon) %>%
+  summarise(n_strains = n(),
+            mean   = round(mean(prop_hipo), 3),
+            median = round(median(prop_hipo), 3)) %>%
+  knitr::kable(caption = "Per-strain proportion of hypomethylated motifs by replicon")
+
+# which strains have plasmid data here, only strains with data in BOTH replicons can be paired
+prop_hipo_cepa %>% filter(replicon == "Plasmid") %>% dplyr::pull(cepa)
+
+shapiro_hipo <- prop_hipo_cepa %>%
+  group_by(replicon) %>%
+  summarise(
+    W       = shapiro.test(prop_hipo)$statistic,
+    p_value = shapiro.test(prop_hipo)$p.value,
+    normal  = ifelse(shapiro.test(prop_hipo)$p.value >= 0.05, "Yes", "No"),
+    .groups = "drop"
+  )
+
+shapiro_hipo %>%
+  mutate(p_value = format(p_value, scientific = TRUE, digits = 3)) %>%
+  knitr::kable(caption = "Shapiro-Wilk test: normality of per-strain hypomethylation proportion by replicon")
+
+prop_hipo_wide <- prop_hipo_cepa %>%
+  select(cepa, replicon, prop_hipo) %>%
+  pivot_wider(names_from = replicon, values_from = prop_hipo) %>%
+  filter(!is.na(Chromosome), !is.na(Plasmid))
+
+whipo <- wilcox.test(prop_hipo_wide$Chromosome, prop_hipo_wide$Plasmid, paired = TRUE)
+
+n_pairs <- nrow(prop_hipo_wide)
+
+# Matched-pairs rank-biserial correlation from the V statistic
+r_rb_hipo <- (4 * whipo$statistic) / (n_pairs * (n_pairs + 1)) - 1
+
+data.frame(
+  Test          = "Wilcoxon signed-rank (paired)",
+  n_pairs       = n_pairs,
+  V             = whipo$statistic,
+  p_value       = format(whipo$p.value, scientific = TRUE),
+  effect_size_r = round(r_rb_hipo, 2)
+) %>%
+  knitr::kable(caption = "Wilcoxon signed-rank test: Chromosome vs Plasmid (per-strain hypomethylation proportion, paired by strain)")
+```
+
+```{r Tabla_2}
+tabla2_dam <- resultado_con_vecinos %>%
+  filter(!is.na(gen_vecino),
+         !grepl("transposase|transposon|invertase|hypothetical", gen_vecino, ignore.case = TRUE),
+         zona != "intra") %>%
+  group_by(gen_vecino, replicon, zona) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = zona, values_from = n, values_fill = 0) %>%
+  left_join(cepas_por_gen, by = c("gen_vecino", "replicon")) %>%
+  mutate(total = upstream + downstream, enzyme = "Dam") %>%
+  filter(n_cepas_total >= 2) %>%
+  select(gen_vecino, enzyme, replicon, downstream, upstream, n_cepas_total, total)
+
+tabla2_dcm <- resultado_con_vecinos_dcm %>%
+  filter(!is.na(gen_vecino),
+         !grepl("transposase|transposon|invertase|hypothetical", gen_vecino, ignore.case = TRUE),
+         zona != "intra") %>%
+  group_by(gen_vecino, replicon, zona) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = zona, values_from = n, values_fill = 0) %>%
+  left_join(cepas_por_gen_dcm, by = c("gen_vecino", "replicon")) %>%
+  mutate(total = upstream + downstream, enzyme = "Dcm") %>%
+  filter(n_cepas_total >= 2) %>%
+  select(gen_vecino, enzyme, replicon, downstream, upstream, n_cepas_total, total)
+
+bind_rows(tabla2_dam, tabla2_dcm) %>%
+  arrange(enzyme, replicon, desc(n_cepas_total)) %>%
+  write.csv2("Resultados/Table_2.csv", row.names = FALSE)
+```
+
+
+## 10. Position of hypomethylated motifs: CDS vs regulatory region by family
+For the three transposase families with the highest number of elements across strains (selected by actual element abundance, not by number of hypomethylation events, to avoid preselecting families based on the very variable of interest), each hypomethylated motif (score ≤ 0.5, Dam+Dcm) was classified according to its position relative to the element: within the coding region (CDS) or within its flanking regulatory window (±200 bp, upstream/downstream). The analysis was performed separately for chromosome and plasmid. Because the regulatory window has a fixed size (400 bp total) while CDS length varies across families, a longer element will accumulate more internal motifs in absolute terms purely as a size effect, even in the absence of any biological pattern; to control for this, the observed CDS percentage for each family was compared against the percentage expected by chance from its median length, assuming a uniform density of motifs per bp.
+
+``` {r figura cds reg familia raw}
+familias_sel <- c("IS3", "IS1", "IS66")
+dam_cds_reg <- resultado_dam %>% mutate(enzima = "Dam")
+dcm_cds_reg <- resultado_dcm %>% mutate(enzima = "Dcm")
+
+cds_reg_plot <- bind_rows(dam_cds_reg, dcm_cds_reg) %>%
+  filter(familia %in% familias_sel) %>%
+  mutate(
+    categoria = ifelse(zona == "intra", "CDS", "Regulatory (±200 bp)"),
+    familia   = factor(familia, levels = familias_sel)
+  ) %>%
+  dplyr::count(familia, enzima, replicon, categoria)
+
+ggplot(cds_reg_plot, aes(x = familia, y = n, fill = categoria)) +
+  geom_col(position = "dodge", width = 0.65) +
+  geom_text(aes(label = n),
+            position = position_dodge(width = 0.65),
+            vjust = -0.4, size = 3) +
+  facet_grid(replicon ~ enzima) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  scale_fill_viridis_d(name = "") +
+  labs(x = "Family", y = "N hypomethylated motifs")
+```
+
+```{r figura cds reg familia replicon}
+tabla_cds_reg_replicon <- bind_rows(dam_cds_reg, dcm_cds_reg) %>%
+  filter(familia %in% familias_sel) %>%
+  mutate(
+    categoria = ifelse(zona == "intra", "CDS", "Regulatory (±200 bp)"),
+    familia   = factor(familia, levels = familias_sel)
+  ) %>%
+  distinct(cepa, contig_num, pos, enzima, familia, categoria, replicon) %>%
+  group_by(familia, categoria, replicon) %>%
+  dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
+  group_by(familia, replicon) %>%
+  mutate(pct = n / sum(n))
+
+tabla_cds_reg_replicon %>%
+  select(familia, replicon, categoria, n, pct) %>%
+  arrange(familia, replicon)
+
+ggplot(tabla_cds_reg_replicon, aes(x = familia, y = pct, fill = categoria)) +
+  geom_col(position = "fill", width = 0.6) +
+  geom_text(aes(label = scales::percent(pct, accuracy = 0.1)),
+            position = position_fill(vjust = 0.5),
+            size = 3.8, color = "white", fontface = "bold") +
+  facet_wrap(~replicon) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_viridis_d(name = "") +
+  labs(x = "Family", y = "Proportion")
+```
+
+
+```{r figura cds reg familia combinado}
+tabla_cds_reg_combinado <- bind_rows(dam_cds_reg, dcm_cds_reg) %>%
+  filter(familia %in% familias_sel) %>%
+  mutate(
+    categoria = ifelse(zona == "intra", "CDS", "Regulatory (±200 bp)"),
+    familia   = factor(familia, levels = familias_sel)
+  ) %>%
+  distinct(cepa, contig_num, pos, enzima, familia, categoria) %>%
+  group_by(familia, categoria) %>%
+  dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
+  group_by(familia) %>%
+  mutate(pct = n / sum(n))
+
+tabla_cds_reg_combinado %>% arrange(familia)
+
+ggplot(tabla_cds_reg_combinado, aes(x = familia, y = pct, fill = categoria)) +
+  geom_col(position = "fill", width = 0.5) +
+  geom_text(aes(label = scales::percent(pct, accuracy = 0.1)),
+            position = position_fill(vjust = 0.5),
+            size = 4, color = "white", fontface = "bold") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_viridis_d(name = "") +
+  labs(x = "Family", y = "Proportion")
+```
+```{r}
+# length by family to compare
+ventanasmeti %>% 
+  filter(familia %in% c("IS3", "IS1", "IS66")) %>% 
+  group_by(familia) %>% 
+  summarise(mediana_pb = median(end - start + 1), n = dplyr::n()) %>%
+  knitr::kable(caption = "Median element length by family",
+               col.names = c("Family", "Median length (bp)", "N elements"))
+```
+
+To test whether each family's regulatory-region enrichment exceeds what its length alone predicts, we compared observed regulatory events against the chance proportion expected from median element length (assuming uniform per-bp motif density), using an exact binomial test: first pooling both replicons (family-wide median), then separately by replicon (using each replicon's own median length, since plasmid-borne and chromosomal copies of the same family can differ substantially in size).
+```{r test familia}
+# Expected regulatory proportion for each family (pooled, used for the combined test)
+medianas <- ventanasmeti %>% 
+  filter(familia %in% c("IS3", "IS1", "IS66")) %>% 
+  group_by(familia) %>% 
+  summarise(mediana_pb = median(end - start + 1), .groups = "drop") %>%
+  mutate(p_esperado_reg = 400 / (mediana_pb + 400))
+
+medianas
+
+# test (chromosome + plasmid) 
+datos_combinado <- tabla_cds_reg_combinado %>%
+  group_by(familia) %>%
+  summarise(
+    n_reg   = n[categoria == "Regulatory (±200 bp)"],
+    n_total = sum(n),
+    .groups = "drop"
+  ) %>%
+  left_join(medianas, by = "familia")
+
+test_combinado <- pmap_dfr(datos_combinado, function(familia, n_reg, n_total, mediana_pb, p_esperado_reg) {
+  bt <- binom.test(n_reg, n_total, p = p_esperado_reg)
+  tibble(
+    familia, n_reg, n_total, mediana_pb, p_esperado_reg,
+    pct_observado = n_reg / n_total,
+    p_valor = bt$p.value,
+    ic95_inf = bt$conf.int[1],
+    ic95_sup = bt$conf.int[2]
+  )
+})
+
+test_combinado
+
+# Expected regulatory proportion for each family, BY REPLICON 
+medianas_replicon <- ventanasmeti %>%
+  filter(familia %in% c("IS3", "IS1", "IS66")) %>%
+  group_by(familia, replicon) %>%
+  summarise(mediana_pb = median(end - start + 1), .groups = "drop") %>%
+  mutate(p_esperado_reg = 400 / (mediana_pb + 400))
+
+medianas_replicon
+
+# Test by replicon 
+datos_replicon <- tabla_cds_reg_replicon %>%
+  group_by(familia, replicon) %>%
+  summarise(
+    n_reg   = n[categoria == "Regulatory (±200 bp)"],
+    n_total = sum(n),
+    .groups = "drop"
+  ) %>%
+  left_join(medianas_replicon, by = c("familia", "replicon"))
+
+test_replicon <- pmap_dfr(datos_replicon, function(familia, replicon, n_reg, n_total, mediana_pb, p_esperado_reg) {
+  bt <- binom.test(n_reg, n_total, p = p_esperado_reg)
+  tibble(
+    familia, replicon, n_reg, n_total, mediana_pb, p_esperado_reg,
+    pct_observado = n_reg / n_total,
+    p_valor = bt$p.value,
+    ic95_inf = bt$conf.int[1],
+    ic95_sup = bt$conf.int[2]
+  )
+})
+
+test_replicon
+```
+
+
+```{r figura4, fig.width=11, fig.height=7.5}
+panel_a <- resultado_dam %>%
+  dplyr::count(zona, replicon) %>%
+  group_by(replicon) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = replicon, y = prop, fill = zona)) +
+  geom_col(position = "fill") +
+  geom_text(aes(label = scales::percent(prop, accuracy = 0.1)),
+            position = position_fill(vjust = 0.5),
+            size = 3, color = "white", fontface = "bold") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_viridis_d(name = "Zone") +
+  labs(x = "Replicon", y = "Proportion", title = "A. Dam") +
+  coord_cartesian(clip = "off") +
+  theme(legend.justification = "top")
+
+panel_b <- resultado_dcm %>%
+  dplyr::count(zona, replicon) %>%
+  group_by(replicon) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = replicon, y = prop, fill = zona)) +
+  geom_col(position = "fill") +
+  geom_text(aes(label = scales::percent(prop, accuracy = 0.1)),
+            position = position_fill(vjust = 0.5),
+            size = 3, color = "white", fontface = "bold") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_viridis_d(name = "Zone") +
+  labs(x = "Replicon", y = "Proportion", title = "B. Dcm") +
+  coord_cartesian(clip = "off") +
+  theme(legend.justification = "top")
+
+panel_c_wide <- datos_hipo_hiper %>%
+  select(enzima, replicon, metilacion, pct) %>%
+  pivot_wider(names_from = metilacion, values_from = pct) %>%
+  rename(pct_hyper = Hypermethylated, pct_hypo = Hypomethylated) %>%
+  mutate(y_hyper_label = pct_hypo + pct_hyper / 2)
+
+panel_c <- ggplot(datos_hipo_hiper, aes(x = enzima, y = pct, fill = metilacion)) +
+  geom_col(position = "fill", width = 0.6) +
+  geom_text(data = panel_c_wide,
+            aes(x = enzima, y = y_hyper_label, label = scales::percent(pct_hyper, accuracy = 0.1)),
+            inherit.aes = FALSE, size = 3, color = "white", fontface = "bold") +
+  geom_text(data = panel_c_wide,
+            aes(x = enzima, y = -0.04, label = scales::percent(pct_hypo, accuracy = 0.1)),
+            inherit.aes = FALSE, size = 3, color = "black", fontface = "bold") +
+  facet_wrap(~replicon) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0.12, 0.05))) +
+  scale_fill_viridis_d(name = "") +
+  labs(x = "Enzyme", y = "Proportion", title = "C. Hypo/hyper") +
+  coord_cartesian(clip = "off") +
+  theme(panel.spacing = unit(1.2, "lines"), strip.text = element_text(size = 9),
+        legend.justification = "top")
+
+panel_d <- bind_rows(dam_cds_reg, dcm_cds_reg) %>%
+  filter(familia %in% familias_sel) %>%
+  mutate(categoria = ifelse(zona == "intra", "CDS", "Regulatory (±200 bp)"),
+         familia = factor(familia, levels = familias_sel)) %>%
+  distinct(cepa, contig_num, pos, enzima, familia, categoria) %>%
+  group_by(familia, categoria) %>%
+  dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
+  group_by(familia) %>%
+  mutate(pct = n / sum(n)) %>%
+  ggplot(aes(x = familia, y = pct, fill = categoria)) +
+  geom_col(position = "fill", width = 0.5) +
+  geom_text(aes(label = scales::percent(pct, accuracy = 0.1)),
+            position = position_fill(vjust = 0.5),
+            size = 3.5, color = "white", fontface = "bold") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_viridis_d(name = "") +
+  labs(x = "Family", y = "Proportion", title = "D. CDS vs regulatory") +
+  theme(legend.justification = "top")
+
+(panel_a + panel_b) / (panel_c + panel_d) +
+  plot_layout(guides = "collect")
+
+ggsave("Resultados/Figure4.jpg", width = 11, height = 7.5, dpi = 300, quality = 100)
+```
+
+## 11. Epigenetic context of resistance genes associated with transposases
+To evaluate whether the hypomethylation associated with resistance genes is located within the gene itself or within its neighboring transposase, two parallel analysis windows were compared: one centered on the genomic coordinates of the resistance gene (the genes validated by CARD, see Section 7) and another centered on the adjacent transposase, both spanning ±200 base pairs and using the same hypomethylation threshold (methylation score ≤ 0.5) and the same distinction between coding sequence and regulatory region used in the preceding sections. For each gene and strain in which the gene is present, hypomethylation was assessed independently for the gene itself and for its nearest neighboring transposase, classifying each as absent, present with no hypomethylation, present with hypomethylation in the regulatory region, or present with hypomethylation within the coding sequence. Comparing these two independent classifications makes it possible to determine directly whether the epigenetic mark falls on the adaptive gene or on the mobile element that accompanies it.
+
+### 11.1 Window centered on the resistance gene
+```{r heatmap resistencia gen}
+# Coordinates + contig of resistance genes from todos_cds 
+resist_coords <- hits_card %>%
+  left_join(
+    todos_cds %>%
+      mutate(cepa = str_extract(Muestra, "^[^_]+")) %>%
+      select(cepa, locus_tag, contig, start_gen = start, end_gen = end),
+    by = c("cepa", "locus_tag")
+  ) %>%
+  filter(!is.na(start_gen)) %>%
+  mutate(
+    contig_num = str_extract(contig, "[0-9]+$"),
+    start_ext  = start_gen - 200,
+    end_ext    = end_gen   + 200
+  )
+
+# by strain + contig_num
+buscar_hipo <- function(wig_full, enzima_nombre) {
+  wig_full %>%
+    filter(score <= 0.5) %>%
+    inner_join(resist_coords, by = c("cepa", "contig_num"),
+               relationship = "many-to-many") %>%
+    filter(pos >= start_ext, pos <= end_ext) %>%
+    mutate(zona = case_when(
+      pos < start_gen ~ "upstream",
+      pos > end_gen   ~ "downstream",
+      TRUE            ~ "intra"
+    )) %>%
+    distinct(cepa, locus_tag, card_name, zona) %>%
+    mutate(enzima = enzima_nombre)
+}
+
+hipo_dam <- buscar_hipo(wig_dam_full, "Dam")
+hipo_dcm <- buscar_hipo(wig_dcm_full, "Dcm")
+hipo_all <- bind_rows(hipo_dam, hipo_dcm)
+
+todas_cepas <- orden_cepas
+todos_genes  <- sort(unique(resist_coords$card_name))
+
+estado_resist <- expand.grid(cepa = todas_cepas, card_name = todos_genes,
+                              stringsAsFactors = FALSE) %>%
+  left_join(
+    resist_coords %>% distinct(cepa, card_name) %>% mutate(presente = TRUE),
+    by = c("cepa", "card_name")
+  ) %>%
+  left_join(
+    hipo_all %>%
+      group_by(cepa, card_name) %>%
+      summarise(
+        hipo_reg = any(zona %in% c("upstream", "downstream")),
+        hipo_cds = any(zona == "intra"),
+        .groups = "drop"
+      ),
+    by = c("cepa", "card_name")
+  ) %>%
+  mutate(estado = case_when(
+    is.na(presente)   ~ "Absent",
+    hipo_cds  == TRUE ~ "Present + CDS hypo",
+    hipo_reg  == TRUE ~ "Present + regulatory hypo",
+    TRUE              ~ "Present, no hypomethylation"
+  ),
+  estado = factor(estado, levels = c(
+    "Absent",
+    "Present, no hypomethylation",
+    "Present + regulatory hypo",
+    "Present + CDS hypo"
+  )))
+
+# Table 
+estado_resist %>%
+  dplyr::count(estado) %>%
+  knitr::kable(caption = "Resistance gene status counts (gene-centered window, all strain-gene pairs)")
+
+mat_R <- estado_resist %>%
+  mutate(val = ifelse(estado == "Absent", 0, 1)) %>%
+  group_by(cepa, card_name) %>%
+  summarise(val = max(val), .groups = "drop") %>%
+  pivot_wider(names_from = card_name, values_from = val, values_fill = 0) %>%
+  column_to_rownames("cepa") %>%
+  as.matrix()
+
+orden_cepas_R <- rownames(mat_R)[hclust(dist(mat_R,    method = "binary"))$order]
+orden_genes_R <- colnames(mat_R)[hclust(dist(t(mat_R), method = "binary"))$order]
+
+estado_resist_ord <- estado_resist %>%
+  group_by(cepa, card_name) %>%
+  slice_max(order_by = estado, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(cepa      = factor(cepa,      levels = orden_cepas_R),
+         card_name = factor(card_name, levels = orden_genes_R))
+
+# Absent left white 
+colores_matriz <- c(
+  "Absent"                       = "white",
+  setNames(viridisLite::viridis(3),
+           c("Present, no hypomethylation", "Present + regulatory hypo", "Present + CDS hypo"))
+)
+
+ggplot(estado_resist_ord, aes(x = card_name, y = cepa, fill = estado)) +
+  geom_tile(color = "grey85", linewidth = 0.3) +
+  scale_fill_manual(values = colores_matriz, name = "") +
+  labs(
+    title    = "Resistance epigenetic matrix (CARD)",
+    subtitle = "Dam/Dcm hypomethylation within \u00b1200 bp window of the resistance gene",
+    x        = "Resistance gene (CARD)",
+    y        = "Strain"
+  ) +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1, vjust = 1, size = 8),
+    axis.text.y      = element_text(size = 8),
+    legend.position  = "top",
+    legend.key.size  = unit(0.4, "cm"),
+    legend.text      = element_text(size = 8),
+    panel.grid       = element_blank(),
+    plot.subtitle    = element_text(size = 9, color = "grey40")
+  )
+```
+
+### 11.2 Window centered on the neighboring transposase
+```{r heatmap resistencia transposasa}
+# rename locus_tag to locus_tag_transposa to avoid the ambiguity when column names matched.
+puente <- tsv_raw %>%
+  mutate(cepa = str_extract(Muestra, "^[^_]+")) %>%
+  filter(!is.na(locus_vecino)) %>%
+  distinct(cepa,
+           locus_tag_transposa = locus_tag,
+           locus_vecino)
+
+resist_con_transposa <- hits_card %>%
+  inner_join(puente, by = c("cepa", "locus_tag" = "locus_vecino"))
+
+# The transposase column is now called locus_tag_transposa and the resistance gene column remains locus_tag.
+hipo_transposa <- bind_rows(dam_cds_reg, dcm_cds_reg) %>%
+  distinct(cepa, locus_tag, zona, enzima)
+
+# join uses locus_tag_transposa not locus_tag.y
+resist_hipo_A <- resist_con_transposa %>%
+  left_join(hipo_transposa,
+            by = c("cepa", "locus_tag_transposa" = "locus_tag"),
+            relationship = "many-to-many") %>%
+  group_by(cepa, card_name) %>%
+  summarise(
+    hipo_reg = any(zona %in% c("upstream", "downstream"), na.rm = TRUE),
+    hipo_cds = any(zona == "intra", na.rm = TRUE),
+    .groups = "drop"
+  )
+
+estado_resist_A <- expand.grid(cepa = orden_cepas,
+                                card_name = sort(unique(hits_card$card_name)),
+                                stringsAsFactors = FALSE) %>%
+  left_join(
+    hits_card %>% distinct(cepa, card_name) %>% mutate(presente = TRUE),
+    by = c("cepa", "card_name")
+  ) %>%
+  left_join(resist_hipo_A, by = c("cepa", "card_name")) %>%
+  mutate(estado = case_when(
+    is.na(presente)   ~ "Absent",
+    hipo_cds == TRUE  ~ "Present + CDS hypo (transposase)",
+    hipo_reg == TRUE  ~ "Present + regulatory hypo (transposase)",
+    TRUE              ~ "Present, no hypomethylation"
+  ),
+  estado = factor(estado, levels = c(
+    "Absent",
+    "Present, no hypomethylation",
+    "Present + regulatory hypo (transposase)",
+    "Present + CDS hypo (transposase)"
+  )))
+
+# Table 
+estado_resist_A %>%
+  dplyr::count(estado) %>%
+  knitr::kable(caption = "Resistance gene status counts (neighboring-transposase window, all strain-gene pairs)")
+
+mat_A <- estado_resist_A %>%
+  mutate(val = ifelse(estado == "Absent", 0, 1)) %>%
+  group_by(cepa, card_name) %>%
+  summarise(val = max(val), .groups = "drop") %>%
+  pivot_wider(names_from = card_name, values_from = val, values_fill = 0) %>%
+  column_to_rownames("cepa") %>%
+  as.matrix()
+
+orden_cepas_A <- rownames(mat_A)[hclust(dist(mat_A,    method = "binary"))$order]
+orden_genes_A <- colnames(mat_A)[hclust(dist(t(mat_A), method = "binary"))$order]
+
+estado_resist_A_ord <- estado_resist_A %>%
+  group_by(cepa, card_name) %>%
+  slice_max(order_by = estado, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(cepa      = factor(cepa,      levels = orden_cepas_A),
+         card_name = factor(card_name, levels = orden_genes_A))
+
+# Absent left white
+colores_A <- c(
+  "Absent"                                   = "white",
+  setNames(viridisLite::viridis(3),
+           c("Present, no hypomethylation",
+             "Present + regulatory hypo (transposase)",
+             "Present + CDS hypo (transposase)"))
+)
+
+ggplot(estado_resist_A_ord, aes(x = card_name, y = cepa, fill = estado)) +
+  geom_tile(color = "grey85", linewidth = 0.3) +
+  scale_fill_manual(values = colores_A, name = "") +
+  labs(
+    title    = "Resistance epigenetic matrix (CARD)",
+    subtitle = "Dam/Dcm hypomethylation within \u00b1200 bp window of the neighboring transposase",
+    x = "Resistance gene (CARD)", y = "Strain"
+  ) +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x     = element_text(angle = 45, hjust = 1, vjust = 1, size = 8),
+        axis.text.y     = element_text(size = 8),
+        legend.position = "top",
+        legend.key.size = unit(0.4, "cm"),
+        legend.text     = element_text(size = 8),
+        panel.grid      = element_blank(),
+        plot.subtitle   = element_text(size = 9, color = "grey40"))
+```
+
+```{r tabla comparacion resistencia}
+comparacion_resist <- estado_resist_ord %>%
+  select(cepa, card_name, estado_gen = estado) %>%
+  inner_join(
+    estado_resist_A_ord %>% select(cepa, card_name, estado_transposa = estado),
+    by = c("cepa", "card_name")
+  ) %>%
+  filter(estado_gen != "Absent")
+
+table(comparacion_resist$estado_gen, comparacion_resist$estado_transposa) %>%
+  knitr::kable(caption = "Resistance gene hypomethylation vs neighboring transposase hypomethylation (cross-tabulation)")
+
+# Cases where the gene IS hypomethylated but its neighboring transposase is NOT
+comparacion_resist %>%
+  filter(estado_gen == "Present + CDS hypo",
+         estado_transposa == "Present, no hypomethylation") %>%
+  select(cepa, card_name) %>%
+  knitr::kable(caption = "Genes with own hypomethylation but non-hypomethylated neighboring transposase")
+
+# Cases where the neighboring transposase IS hypomethylated but the gene NOT
+comparacion_resist %>%
+  filter(estado_gen == "Present, no hypomethylation",
+         estado_transposa %in% c("Present + CDS hypo (transposase)", "Present + regulatory hypo (transposase)")) %>%
+  select(cepa, card_name, estado_transposa) %>%
+  knitr::kable(caption = "Genes with non-hypomethylated own gene but hypomethylated neighboring transposase")
+```
+
+## 12. Epigenetic context of the functional neighborhood of transposases
+The two-window comparison of Section 11 was extended from CARD-validated resistance genes to all neighbouring genes in the four adaptive categories (Resistance, Virulence/Adherence, Toxin-Antitoxin/SOS and Plasmid maintenance). Only regulatory hypomethylation (upstream or downstream, excluding the coding sequence) was considered, and each case corresponds to a gene, strain and enzyme combination. For each category, the number of cases with regulatory hypomethylation in the window centred on the neighbouring transposase was compared with the number in the window centred on the gene itself, to test whether the pattern observed for resistance genes holds across adaptive functions.
+
+```{r categorias interes}
+# Define the 4 "adaptive" categories of interest for this analysis
+
+categorias_interes <- c("Resistance", "Virulence/Adherence", "Toxin-Antitoxin/SOS", "Plasmid maintenance")
+# Gene -> category dictionary, filtered to the categories of interest
+dicc_cat <- vecindario_clasificado %>%
+  filter(categoria %in% categorias_interes) %>%
+  distinct(gen_vecino, categoria)
+
+# Bridge cepa/locus_tag/gen_vecino, keeping "posicion" (upstream/downstream) 
+puente_vecino <- tsv_raw %>%
+  distinct(cepa, locus_tag, gen_vecino, posicion)
+```
+
+```{r hipo reg genes}
+# Regulatory position hypomethylation (excluding the transposase's own CDS) for neighboring genes in one of the 4 adaptive categories. The join now matches upstream/downstream of the hypomethylated site relative to the transposase to posicion 
+hipo_reg_genes <- bind_rows(dam_cds_reg, dcm_cds_reg) %>%
+  filter(zona != "intra") %>%
+  inner_join(puente_vecino, by = c("cepa", "locus_tag", "zona" = "posicion")) %>%
+  inner_join(dicc_cat, by = "gen_vecino") %>%
+  distinct(cepa, locus_tag, gen_vecino, categoria, enzima) %>%
+  group_by(gen_vecino, categoria, enzima) %>%
+  summarise(n_cepas = n_distinct(cepa), .groups = "drop")
+
+hipo_reg_genes %>% arrange(desc(n_cepas)) %>% knitr::kable()
+```
+
+```{r hipo cat agregado, fig.width=9, fig.height=6}
+# Aggregate by category and enzyme 
+hipo_cat <- hipo_reg_genes %>%
+  group_by(categoria, enzima) %>%
+  summarise(n_cepas = sum(n_cepas), .groups = "drop") %>%
+  pivot_wider(names_from = enzima, values_from = n_cepas, values_fill = 0) %>%
+  rename(n_dam = Dam, n_dcm = Dcm) %>%
+  # keep the original order of categorias
+  mutate(categoria = factor(categoria, levels = categorias_interes),
+         y_pos = as.numeric(categoria))
+
+max_val <- max(hipo_cat$n_dam, hipo_cat$n_dcm)
+
+ggplot(hipo_cat) +
+  geom_rect(aes(xmin = -n_dcm, xmax = n_dam,
+                ymin = y_pos - 0.35, ymax = y_pos + 0.35,
+                fill = categoria)) +
+  geom_text(aes(x = -n_dcm, y = y_pos, label = n_dcm), hjust = 1.4, size = 3.5) +
+  geom_text(aes(x = n_dam, y = y_pos, label = n_dam), hjust = -0.4, size = 3.5) +
+  geom_vline(xintercept = 0, color = "black") +
+  annotate("text", x = -max_val * 0.55, y = max(hipo_cat$y_pos) + 0.9,
+           label = "\u2190 Dcm", fontface = "bold", size = 5) +
+  annotate("text", x = max_val * 0.55, y = max(hipo_cat$y_pos) + 0.9,
+           label = "Dam \u2192", fontface = "bold", size = 5) +
+  scale_y_continuous(breaks = seq_along(categorias_interes), labels = categorias_interes,
+                      expand = expansion(mult = c(0.15, 0.25))) +
+  scale_x_continuous(limits = c(-max_val * 1.4, max_val * 1.4),
+                      breaks = seq(-20, 20, 5), labels = abs) +
+  scale_fill_viridis_d(name = "") +
+  labs(
+    title = "Regulatory hypomethylation by functional category",
+    subtitle = "Sum of strains \u2014 Dam (right) vs Dcm (left)",
+    x = "N strains (sum)",
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold"),
+    axis.text.y = element_text(face = "bold", size = 11)
+  )
+```
+
+```{r hipo gen wide}
+# Wide format (n_dam/n_dcm) + wrapped gene names + large gaps between category blocks so no expansion margin can "leak" into the neighboring category and  show a label without its bar
+hipo_gen_wide <- hipo_reg_genes %>%
+  mutate(gen_corto = str_wrap(gen_vecino, width = 20)) %>%
+  group_by(gen_corto, categoria, enzima) %>%
+  summarise(n_cepas = sum(n_cepas), .groups = "drop") %>%
+  pivot_wider(names_from = enzima, values_from = n_cepas, values_fill = 0) %>%
+  rename(n_dam = Dam, n_dcm = Dcm) %>%
+  mutate(categoria = factor(categoria, levels = categorias_interes)) %>%
+  arrange(categoria, gen_corto) %>%
+  group_by(categoria) %>%
+  mutate(fila = row_number()) %>%
+  ungroup() %>%
+  mutate(y_pos = fila + as.numeric(categoria) * 1000)
+```
+
+```{r hipo-gen-nivel, fig.width=11, fig.height=8.5}
+# Individual-gene version, same interval style as the by-category chart
+max_val_gen <- max(hipo_gen_wide$n_dam, hipo_gen_wide$n_dcm)
+ggplot(hipo_gen_wide) +
+  geom_rect(aes(xmin = -n_dcm, xmax = n_dam,
+                ymin = y_pos - 0.35, ymax = y_pos + 0.35,
+                fill = categoria)) +
+  geom_text(aes(x = -n_dcm, y = y_pos, label = n_dcm), hjust = 1.3, size = 3) +
+  geom_text(aes(x = n_dam, y = y_pos, label = n_dam), hjust = -0.3, size = 3) +
+  geom_vline(xintercept = 0, color = "black") +
+  annotate("text", x = -max_val_gen * 0.6, y = Inf,
+           label = "\u2190 Dcm", fontface = "bold", size = 4, vjust = 1.5) +
+  annotate("text", x = max_val_gen * 0.6, y = Inf,
+           label = "Dam \u2192", fontface = "bold", size = 4, vjust = 1.5) +
+  facet_wrap(~categoria, scales = "free_y") +
+  scale_y_continuous(
+    breaks = hipo_gen_wide$y_pos,
+    labels = hipo_gen_wide$gen_corto,
+    expand = expansion(add = 0.6, mult = c(0, 0.15))
+  ) +
+  scale_x_continuous(
+    breaks = seq(-20, 20, 5), labels = abs,
+    limits = c(-max_val_gen * 1.4, max_val_gen * 1.4)
+  ) +
+  scale_fill_viridis_d(name = "") +
+  labs(
+    title = "Adaptive genes with regulatory hypomethylation, by category",
+    subtitle = "N strains \u2014 Dam (right) vs Dcm (left)",
+    x = "N strains",
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none", strip.text = element_text(face = "bold"),
+        axis.text.y = element_text(size = 7.5))
+```
+
+```{r comparacion gen vs transposa}
+# Neighboring adaptive genes (4 categories) with their own locus
+genes_adapt <- tsv_raw %>%
+  mutate(cepa = str_extract(Muestra, "^[^_]+")) %>%
+  filter(!is.na(locus_vecino), !is.na(gen_vecino)) %>%
+  inner_join(dicc_cat, by = "gen_vecino") %>%
+  distinct(cepa, locus_vecino, gen_vecino, categoria)
+
+# Coordinates + contig of the adaptive gene (from todos_cds)
+coords_adapt <- genes_adapt %>%
+  left_join(
+    todos_cds %>%
+      mutate(cepa = str_extract(Muestra, "^[^_]+")) %>%
+      select(cepa, locus_tag, contig, start_gen = start, end_gen = end),
+    by = c("cepa", "locus_vecino" = "locus_tag")
+  ) %>%
+  filter(!is.na(start_gen)) %>%
+  mutate(contig_num = str_extract(contig, "[0-9]+$"),
+         start_ext  = start_gen - 200,
+         end_ext    = end_gen   + 200)
+
+# Hypomethylation window CENTERED ON THE GENE 
+buscar_hipo_gen <- function(wig_full, enz) {
+  wig_full %>%
+    filter(score <= 0.5) %>%
+    inner_join(coords_adapt, by = c("cepa", "contig_num"),
+               relationship = "many-to-many") %>%
+    filter(pos >= start_ext, pos <= end_ext) %>%
+    mutate(zona = case_when(
+      pos < start_gen ~ "upstream",
+      pos > end_gen   ~ "downstream",
+      TRUE            ~ "intra"
+    )) %>%
+    distinct(cepa, locus_vecino, gen_vecino, categoria, zona) %>%
+    mutate(enzima = enz)
+}
+
+hipo_gen_all <- bind_rows(
+  buscar_hipo_gen(wig_dam_full, "Dam"),
+  buscar_hipo_gen(wig_dcm_full, "Dcm")
+)
+
+# Regulatory position only 
+hipo_reg_gen_propio <- hipo_gen_all %>%
+  filter(zona != "intra") %>%
+  group_by(gen_vecino, categoria, enzima) %>%
+  summarise(n_cepas = n_distinct(cepa), .groups = "drop") %>%
+  arrange(categoria, desc(n_cepas))
+
+# regulatory hypomethylation on the gene itself vs. on the neighboring transposase 
+comparacion_gen_vs_transposa <- full_join(
+  hipo_reg_gen_propio %>% rename(n_gen_propio = n_cepas),
+  hipo_reg_genes       %>% rename(n_transposa = n_cepas),
+  by = c("gen_vecino", "categoria", "enzima")
+) %>%
+  mutate(n_gen_propio = tidyr::replace_na(n_gen_propio, 0L),
+         n_transposa  = tidyr::replace_na(n_transposa, 0L))
+hipo_reg_gen_propio %>% knitr::kable()
+```
+
+```{r hipo cat gen propio, fig.width=9, fig.height=6}
+# Aggregate by category and enzyme, window centered on the adaptive gene itself
+hipo_cat_gen <- hipo_reg_gen_propio %>%
+  group_by(categoria, enzima) %>%
+  summarise(n_cepas = sum(n_cepas), .groups = "drop") %>%
+  pivot_wider(names_from = enzima, values_from = n_cepas, values_fill = 0) %>%
+  rename(n_dam = Dam, n_dcm = Dcm) %>%
+  mutate(categoria = factor(categoria, levels = categorias_interes),
+         y_pos = as.numeric(categoria))
+
+max_val_gp <- max(hipo_cat_gen$n_dam, hipo_cat_gen$n_dcm)
+
+ggplot(hipo_cat_gen) +
+  geom_rect(aes(xmin = -n_dcm, xmax = n_dam,
+                ymin = y_pos - 0.35, ymax = y_pos + 0.35,
+                fill = categoria)) +
+  geom_text(aes(x = -n_dcm, y = y_pos, label = n_dcm), hjust = 1.4, size = 3.5) +
+  geom_text(aes(x = n_dam, y = y_pos, label = n_dam), hjust = -0.4, size = 3.5) +
+  geom_vline(xintercept = 0, color = "black") +
+  annotate("text", x = -max_val_gp * 0.55, y = max(hipo_cat_gen$y_pos) + 0.9,
+           label = "\u2190 Dcm", fontface = "bold", size = 5) +
+  annotate("text", x = max_val_gp * 0.55, y = max(hipo_cat_gen$y_pos) + 0.9,
+           label = "Dam \u2192", fontface = "bold", size = 5) +
+  scale_y_continuous(breaks = seq_along(categorias_interes), labels = categorias_interes,
+                      expand = expansion(mult = c(0.15, 0.25))) +
+  scale_x_continuous(limits = c(-max_val_gp * 1.4, max_val_gp * 1.4),
+                      breaks = seq(-20, 20, 5), labels = abs) +
+  scale_fill_viridis_d(name = "") +
+  labs(
+    title = "Regulatory hypomethylation by functional category",
+    subtitle = "Window centered on the adaptive gene \u2014 Dam (right) vs Dcm (left)",
+    x = "N strains (sum)",
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold"),
+    axis.text.y = element_text(face = "bold", size = 11)
+  )
+```
+
+```{r hipo gen wide propio}
+hipo_gen_wide_propio <- hipo_reg_gen_propio %>%
+  mutate(gen_corto = str_wrap(gen_vecino, width = 20)) %>%
+  group_by(gen_corto, categoria, enzima) %>%
+  summarise(n_cepas = sum(n_cepas), .groups = "drop") %>%
+  pivot_wider(names_from = enzima, values_from = n_cepas, values_fill = 0) %>%
+  rename(n_dam = Dam, n_dcm = Dcm) %>%
+  mutate(categoria = factor(categoria, levels = categorias_interes)) %>%
+  arrange(categoria, gen_corto) %>%
+  group_by(categoria) %>%
+  mutate(fila = row_number()) %>%
+  ungroup() %>%
+  mutate(y_pos = fila + as.numeric(categoria) * 1000)
+```
+
+```{r hipo-gen-nivel-propio, fig.width=11, fig.height=8.5}
+# Individual-gene version, window centered on the gene itself
+max_val_gen_propio <- max(hipo_gen_wide_propio$n_dam, hipo_gen_wide_propio$n_dcm)
+ggplot(hipo_gen_wide_propio) +
+  geom_rect(aes(xmin = -n_dcm, xmax = n_dam,
+                ymin = y_pos - 0.35, ymax = y_pos + 0.35,
+                fill = categoria)) +
+  geom_text(aes(x = -n_dcm, y = y_pos, label = n_dcm), hjust = 1.3, size = 3) +
+  geom_text(aes(x = n_dam, y = y_pos, label = n_dam), hjust = -0.3, size = 3) +
+  geom_vline(xintercept = 0, color = "black") +
+  annotate("text", x = -max_val_gen_propio * 0.6, y = Inf,
+           label = "\u2190 Dcm", fontface = "bold", size = 4, vjust = 1.5) +
+  annotate("text", x = max_val_gen_propio * 0.6, y = Inf,
+           label = "Dam \u2192", fontface = "bold", size = 4, vjust = 1.5) +
+  facet_wrap(~categoria, scales = "free_y") +
+  scale_y_continuous(
+    breaks = hipo_gen_wide_propio$y_pos,
+    labels = hipo_gen_wide_propio$gen_corto,
+    expand = expansion(add = 0.6, mult = c(0, 0.15))
+  ) +
+  scale_x_continuous(
+    breaks = seq(-10, 10, 2), labels = abs,
+    limits = c(-max_val_gen_propio * 1.4, max_val_gen_propio * 1.4)
+  ) +
+  scale_fill_viridis_d(name = "") +
+  labs(
+    title = "Adaptive genes with hypomethylation in their own regulatory region",
+    subtitle = "Window centered on the gene itself \u2014 Dam (right) vs Dcm (left)",
+    x = "N strains",
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none", strip.text = element_text(face = "bold"),
+        axis.text.y = element_text(size = 7.5))
+```
+
+```{r resumen gen vs transposa}
+resumen_gen_vs_transposa <- comparacion_gen_vs_transposa %>%
+  group_by(categoria) %>%
+  summarise(`Own gene` = sum(n_gen_propio),
+            `Neighboring transposase` = sum(n_transposa),
+            .groups = "drop") %>%
+  tidyr::pivot_longer(cols = c(`Own gene`, `Neighboring transposase`),
+                      names_to = "centro", values_to = "n_cepas")
+
+ggplot(resumen_gen_vs_transposa,
+       aes(x = reorder(categoria, -n_cepas), y = n_cepas, fill = centro)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  geom_text(aes(label = n_cepas),
+            position = position_dodge(width = 0.7),
+            vjust = -0.4, size = 3.8) +
+  scale_fill_viridis_d(name = "") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title    = "Where does regulatory hypomethylation fall?",
+    subtitle = "\u00b1200 bp window centered on the adaptive gene vs. the neighboring transposase",
+    x = NULL, y = "N strains (sum)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "top",
+    axis.text.x     = element_text(size = 10, face = "bold"),
+    panel.grid.minor = element_blank(),
+    plot.title      = element_text(size = 13, face = "bold")
+  )
+```
+
+```{r comparacion gen vs transposasa}
+comparacion_gen_vs_transposa %>%
+  filter(n_transposa > 0, n_gen_propio == 0) %>%
+  arrange(desc(n_transposa)) %>%
+  knitr::kable()
+
+comparacion_gen_vs_transposa %>%
+  filter(n_gen_propio > 0, n_transposa == 0) %>%
+  arrange(desc(n_gen_propio)) %>%
+  knitr::kable()
+
+# resistance genes with no own-gene hypomethylation where the neighboring transposase IS hypomethylated
+tabla3_discordancia <- comparacion_resist %>%
+  filter(estado_gen == "Present, no hypomethylation",
+         estado_transposa %in% c("Present + regulatory hypo (transposase)",
+                                  "Present + CDS hypo (transposase)")) %>%
+  mutate(localizacion = case_when(
+    estado_transposa == "Present + CDS hypo (transposase)" ~ "Coding sequence",
+    estado_transposa == "Present + regulatory hypo (transposase)" ~ "Regulatory region"
+  )) %>%
+  select(card_name, cepa, localizacion) %>%
+  arrange(card_name, cepa) %>%
+  rename(`Resistance gene` = card_name,
+         Strain = cepa,
+         `Location in neighboring transposase` = localizacion)
+
+knitr::kable(tabla3_discordancia)
+write.csv2(tabla3_discordancia, "Resultados/Table_3.csv", row.names = FALSE)
+```
+
+## 13. Model locus architecture
+To illustrate the co-localization between hypomethylation in the vicinity of transposases and neighboring adaptive genes, two model loci are shown, each with a distinct architecture and functional category. The first, on the chromosome of strain DA63884, shows the multidrug transporter mdtM in a divergent orientation next to its neighboring transposase (ISNCY family, ISRor2). The second, on a plasmid of strain DA63210, shows the replication regulator repA in a codirectional orientation with its neighboring transposase (IS6 family, IS26). In both cases, dots mark the hypomethylated GATC/CCWGG sites (score ≤ 0.5) present within the represented region, distinguishing Dam and Dcm methylation by color.
+
+```{r figure5}
+# Draws a two-gene locus (one transposase + one neighboring gene) with hypomethylated Dam/Dcm sites 
+plot_locus <- function(cepa_sel, locus_transposa, locus_vec, etiqueta_vecino,
+                        titulo, color_vecino = "#2E86AB") {
+
+  cds <- todos_cds %>% mutate(cepa = str_extract(Muestra, "^[^_]+"))
+  tp  <- cds %>% filter(cepa == cepa_sel, locus_tag == locus_transposa)
+  vc  <- cds %>% filter(cepa == cepa_sel, locus_tag == locus_vec)
+
+  genes_df <- data.frame(
+    molecule = titulo,
+    gene     = c(etiqueta_vecino, "Transposase"),
+    start    = c(vc$start, tp$start),
+    end      = c(vc$end, tp$end),
+    forward  = c(vc$strand == "+", tp$strand == "+"),
+    tipo     = c("vecino", "transposasa")
+  )
+
+  #  methylation  to the genomic window 
+  contig_n  <- str_extract(tp$contig, "[0-9]+$")
+  rango_ini <- min(genes_df$start)
+  rango_fin <- max(genes_df$end)
+
+  # the legend always shows both keys,even when a given locus only has hypomethylation from one enzyme
+  motivos_df <- bind_rows(
+    wig_dam_full %>% mutate(enzima = "Dam"),
+    wig_dcm_full %>% mutate(enzima = "Dcm")
+  ) %>%
+    filter(cepa == cepa_sel, contig_num == contig_n, score <= 0.5,
+           pos >= rango_ini, pos <= rango_fin) %>%
+    distinct(pos, enzima) %>%
+    mutate(molecule = titulo,
+           enzima   = factor(enzima, levels = c("Dam", "Dcm")))
+
+  ggplot(genes_df, aes(xmin = start, xmax = end, y = molecule, fill = tipo, forward = forward)) +
+    geom_gene_arrow(arrowhead_height = unit(8, "mm"), arrowhead_width = unit(3, "mm"),
+                    arrow_body_height = unit(8, "mm")) +
+    geom_point(data = motivos_df, aes(x = pos, y = molecule, color = enzima),
+               inherit.aes = FALSE, size = 4.2) +
+    scale_color_viridis_d(name = NULL, drop = FALSE,
+                          labels = c("Dam" = "Dam hypomethylated site (score \u2264 0.5)",
+                                     "Dcm" = "Dcm hypomethylated site (score \u2264 0.5)")) +
+    scale_fill_manual(values = c("transposasa" = "grey60", "vecino" = color_vecino),
+                       labels = c("transposasa" = "Transposase", "vecino" = etiqueta_vecino)) +
+    guides(fill = guide_legend(nrow = 2), color = guide_legend(nrow = 2)) +
+    scale_x_continuous(labels = scales::comma, expand = expansion(mult = 0.02))  +
+    labs(title = titulo, x = "Position (bp)", y = NULL, fill = NULL) +
+    theme_genes() +
+    theme(legend.position = "right",
+          plot.title = element_text(face = "bold", size = 12),
+          axis.text.y = element_blank(), axis.ticks.y = element_blank())
+}
+
+library(forcats)
+
+# Panel B: own gene vs. neighboring transposase, by functional category
+comparacion_categoria <- tibble::tribble(
+  ~categoria,              ~ventana,                    ~casos,
+  "Resistance",            "Own adaptive gene",           17,
+  "Resistance",            "Neighboring transposase",     11,
+  "Virulence/Adherence",   "Own adaptive gene",           15,
+  "Virulence/Adherence",   "Neighboring transposase",      6,
+  "Plasmid maintenance",   "Own adaptive gene",            7,
+  "Plasmid maintenance",   "Neighboring transposase",      7,
+  "Toxin-Antitoxin/SOS",   "Own adaptive gene",            5,
+  "Toxin-Antitoxin/SOS",   "Neighboring transposase",      4
+) %>%
+  mutate(
+    categoria = factor(categoria, levels = c("Resistance", "Virulence/Adherence",
+                                              "Plasmid maintenance", "Toxin-Antitoxin/SOS")),
+    ventana = factor(ventana, levels = c("Own adaptive gene", "Neighboring transposase"))
+  )
+
+panel_b <- ggplot(comparacion_categoria, aes(x = categoria, y = casos, fill = ventana)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  geom_text(aes(label = casos), position = position_dodge(width = 0.7),
+            vjust = -0.4, size = 4) +
+  scale_fill_viridis_d(name = NULL, begin = 0.15, end = 0.75) +
+  scale_x_discrete(labels = function(x) stringr::str_wrap(x, width = 10)) +
+  labs(x = NULL, y = "Number of hypomethylated cases") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top", panel.grid.major.x = element_blank(),
+        axis.text.x = element_text(size = 10))
+
+# Panel A: cross-tabulate each resistance gene's hypomethylation window vs. its neighboring transposase's
+etiquetas     <- c("CDS hypo", "Regulatory hypo", "No hypomethylation")
+niveles_gen   <- c("Present + CDS hypo", "Present + regulatory hypo", "Present, no hypomethylation")
+niveles_trans <- c("Present + CDS hypo (transposase)", "Present + regulatory hypo (transposase)", "Present, no hypomethylation")
+
+crosstab_heatmap <- comparacion_resist %>%
+  dplyr::mutate(
+    gen_lab   = factor(estado_gen,       levels = niveles_gen,   labels = etiquetas),
+    trans_lab = factor(estado_transposa, levels = niveles_trans, labels = etiquetas)
+  ) %>%
+  dplyr::count(gen_lab, trans_lab, .drop = FALSE, name = "n_pares") %>%
+  dplyr::mutate(
+    concordante = gen_lab == trans_lab,
+    etiqueta = dplyr::case_when(
+      n_pares == 0 ~ "",
+      gen_lab == "No hypomethylation" & trans_lab == "CDS hypo" ~ paste0(n_pares, "\n(all mdtM)"),
+      TRUE ~ as.character(n_pares)
+    ),
+    n_pares_fill = ifelse(n_pares == 0, NA, n_pares)
+  )
+
+panel_a <- ggplot(crosstab_heatmap, aes(x = trans_lab, y = fct_rev(gen_lab), fill = n_pares_fill)) +
+  geom_tile(color = "white", linewidth = 1.2) +
+  geom_text(aes(label = etiqueta, fontface = ifelse(concordante, "bold", "plain")),
+            color = "white", size = 4.5, lineheight = 0.9) +
+  scale_fill_viridis_c(name = "Gene-strain\npairs", na.value = "grey90") +
+  scale_x_discrete(labels = function(x) stringr::str_wrap(x, width = 10)) +
+  labs(x = "Neighboring transposase window", y = "Own adaptive gene window") +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid = element_blank(),
+        axis.text = element_text(size = 10),
+        legend.title = element_text(margin = margin(b = 10)),
+        legend.key.height = unit(1.1, "cm"),
+        legend.key.width = unit(0.5, "cm"),
+        plot.margin = margin(10, 20, 10, 10))
+
+# Panel C: repA / DA63210 (plasmid, concordant case)
+panel_c <- plot_locus(
+  cepa_sel        = "DA63210",
+  locus_transposa = "OHAPBCAJ_04761",
+  locus_vec       = "OHAPBCAJ_04762",
+  etiqueta_vecino = "Replication regulator (RepA)",
+  titulo          = "repA_panel",
+  color_vecino    = "#F4A261"
+) + labs(title = NULL) + theme(legend.position = "bottom")
+
+# Panel D: mdtM / DA63884 (chromosome, discordant case)
+panel_d <- plot_locus(
+  cepa_sel        = "DA63884",
+  locus_transposa = "IMMICPAG_03201",
+  locus_vec       = "IMMICPAG_03200",
+  etiqueta_vecino = "Multidrug transporter (mdtM)",
+  titulo          = "mdtM_panel",
+  color_vecino    = "#F4A261"
+) + labs(title = NULL) + theme(legend.position = "bottom")
+
+# Combine all four panels into the final Figure 5 and save
+figura5 <- (panel_a + panel_b) / (panel_c + panel_d) +
+  patchwork::plot_layout(heights = c(2, 1)) +
+  patchwork::plot_annotation(tag_levels = "A")
+
+ggsave("Resultados/Figure5.jpg",
+       figura5, width = 14, height = 8.5, dpi = 300, quality = 100)
+
+figura5
+```
+
+## 14. Genomic context of transposases: extended neighbourhood and hypomethylation
+For each transposase identified across the 28 strains, the three flanking genes on each side (left and right) are extracted based on genomic coordinates, regardless of whether they are functionally annotated or hypothetical. For each of these neighboring genes, Dam or Dcm hypomethylation is assessed in the regulatory position (upstream or downstream, excluding the CDS itself) within a ±200 bp window centered on the neighbor's own coordinates (not on the transposase's), keeping the same regulatory-hypomethylation criterion used throughout the rest of this work. This makes it possible to check whether the immediate genomic environment of the mobile element is epigenetically marked, and whether that mark depends on distance (in number of genes) from the transposase. As a control, the composition of this extended neighbourhood is also examined, since some of these flanking "genes" may themselves be other transposases rather than host genes.
+
+```{r extraccion vecindario ampliado}
+# Extract the 3 flanking genes on each side
+trans_keys <- trans %>%
+  mutate(cepa = str_extract(Muestra, "^[^_]+")) %>%
+  transmute(k = paste(cepa, locus_tag)) %>%
+  dplyr::pull(k)
+
+cds_ord <- todos_cds %>%
+  mutate(cepa  = str_extract(Muestra, "^[^_]+"),
+         is_tp = paste(cepa, locus_tag) %in% trans_keys) %>%
+  arrange(cepa, contig, start) %>%
+  group_by(cepa, contig) %>%
+  mutate(idx = row_number()) %>%
+  ungroup()
+
+transposasas <- cds_ord %>%
+  filter(is_tp) %>%
+  select(cepa, contig, locus_tp = locus_tag, idx_tp = idx)
+
+vecindario_ampliado <- transposasas %>%
+  tidyr::crossing(offset = c(-3, -2, -1, 1, 2, 3)) %>%
+  mutate(idx_vec  = idx_tp + offset,
+         lado     = ifelse(offset < 0, "izquierda", "derecha"),
+         posicion = paste0(lado, "_", abs(offset))) %>%
+  left_join(
+    cds_ord %>% select(cepa, contig, idx,
+                       locus_vec = locus_tag, gen_vecino = product,
+                       start_vec = start, end_vec = end, strand_vec = strand),
+    by = c("cepa", "contig", "idx_vec" = "idx")
+  ) %>%
+  filter(!is.na(locus_vec))
+
+vecindario_win <- vecindario_ampliado %>%
+  mutate(contig_num = str_extract(contig, "[0-9]+$"),
+         start_ext  = start_vec - 200,
+         end_ext    = end_vec + 200)
+
+cat("Transposasas:", nrow(transposasas),
+    "| Relaciones transposasa-vecino:", nrow(vecindario_ampliado), "\n")
+```
+
+```{r busqueda hipometilacion vecinos}
+# Hypomethylation (±200 bp) around each neighboring gene
+buscar_hipo_vecino <- function(wig_full, enz) {
+  map_dfr(unique(vecindario_win$cepa), function(cc) {
+    wig_full %>%
+      filter(cepa == cc, score <= 0.5) %>%
+      inner_join(filter(vecindario_win, cepa == cc),
+                 by = c("cepa", "contig_num"), relationship = "many-to-many") %>%
+      filter(pos >= start_ext, pos <= end_ext) %>%
+      mutate(zona = case_when(pos < start_vec ~ "upstream",
+                              pos > end_vec   ~ "downstream",
+                              TRUE            ~ "intra")) %>%
+      distinct(cepa, locus_tp, posicion, locus_vec, gen_vecino, pos, zona)
+  }) %>% mutate(enzima = enz)
+}
+
+hipo_vecindario <- bind_rows(buscar_hipo_vecino(wig_dam_full, "Dam"),
+                             buscar_hipo_vecino(wig_dcm_full, "Dcm"))
+```
+
+```{r hipometilacion por distancia}
+# Regulatory hypomethylation as a function of distance to the transposase (regulatory region only)
+total_por_posicion <- vecindario_ampliado %>%
+  dplyr::count(posicion, name = "n_total")
+
+hipo_por_posicion <- hipo_vecindario %>%
+  dplyr::filter(zona != "intra") %>%
+  dplyr::distinct(cepa, locus_tp, posicion, enzima) %>%
+  dplyr::count(posicion, enzima, name = "n_hipo")
+
+resumen_pos <- hipo_por_posicion %>%
+  dplyr::left_join(total_por_posicion, by = "posicion") %>%
+  dplyr::mutate(pct    = n_hipo / n_total,
+                offset = as.integer(str_extract(posicion, "[0-9]$")) *
+                         ifelse(str_detect(posicion, "izquierda"), -1, 1))
+
+resumen_pos %>%
+  dplyr::arrange(offset, enzima) %>%
+  dplyr::mutate(posicion_en = ifelse(offset < 0, paste0("Left ", offset), paste0("Right +", offset))) %>%
+  dplyr::select(posicion_en, enzima, n_hipo, n_total, pct) %>%
+  knitr::kable(caption = "Neighbor genes with regulatory hypomethylation by position relative to the transposase",
+               digits = 3,
+               col.names = c("Position", "Enzyme", "N hypomethylated", "N total", "Proportion"))
+
+ggplot(resumen_pos, aes(x = factor(offset,
+                                   levels = c(-3,-2,-1,1,2,3),
+                                   labels = c("-3","-2","-1","+1","+2","+3")),
+                        y = pct, fill = enzima)) +
+  geom_col(position = "dodge", width = 0.7) +
+  geom_vline(xintercept = 3.5, linetype = "dashed", color = "grey40") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_color_viridis_d(aesthetics = "fill", name = "Enzyme") +
+  labs(title    = "Regulatory hypomethylation by distance to the transposase",
+       subtitle = "Flanking genes \u00b11, \u00b12, \u00b13 | dashed line = transposase position",
+       x = "Neighbor gene position (number of genes from the transposase)",
+       y = "Genes with regulatory hypomethylation (%)", fill = "Enzyme") +
+  theme_minimal(base_size = 12)
+```
+
+```{r composicion del vecindario}
+# How many of the neighboring genes (±1, ±2, ±3) are actually other transposases?
+vecindario_ampliado <- vecindario_ampliado %>%
+  dplyr::mutate(vecino_es_transposasa = paste(cepa, locus_vec) %in% trans_keys)
+
+# Overall summary
+vecindario_ampliado %>%
+  dplyr::count(vecino_es_transposasa) %>%
+  dplyr::mutate(pct = round(100 * n / sum(n), 1)) %>%
+  knitr::kable(
+    caption = "Composition of the extended neighbourhood: transposase vs. non-transposase neighbors",
+    col.names = c("Neighbor is a transposase", "N relationships", "Percentage (%)")
+  )
+
+# Breakdown by position
+vecindario_ampliado %>%
+  dplyr::count(posicion, vecino_es_transposasa) %>%
+  dplyr::group_by(posicion) %>%
+  dplyr::mutate(pct = round(100 * n / sum(n), 1)) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(posicion, vecino_es_transposasa) %>%
+  knitr::kable(
+    caption = "Composition of the extended neighbourhood by position relative to the transposase",
+    col.names = c("Position", "Neighbor is a transposase", "N relationships", "Percentage (%)")
+  )
+```
